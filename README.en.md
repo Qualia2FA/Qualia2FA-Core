@@ -32,7 +32,7 @@ as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.2.2` |
+| Version | `0.3.0` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -50,9 +50,9 @@ The following features are supported:
 - Base32 (RFC 4648, in both lenient and strict modes)
 - URI parsing and serialization (`otpauth://` and Aegis's `motp:` form)
 - The encrypted vault (local storage format)
-- **Groups and orderings (including their synchronization and conflict adjudication)**
-- **Importing from Aegis's JSON / HTML / TXT exports (encrypted exports included)**
-- Recovery keys
+- **A tree of groups (parent links, entries and child groups in one order)**
+- **Importing from Aegis's JSON / HTML / TXT exports (encrypted exports included), icons included**
+- Recovery keys and the `.q2fa` containers (plain and encrypted vault)
 - Challenge-response authentication
 - Device pairing
 - Sync payloads and merging
@@ -156,17 +156,18 @@ A few things worth knowing:
 
 ## Compatibility
 
-**Vault format version: 3.** This version always writes version 3, and still reads version 1
-and version 2 files (the readable set only grows). An older application reading a version 3
-file gets a clear "unsupported version" error; **the one exception** is the version 1 parser,
-which reports trailing bytes (the 32-byte master key check value looks like extra content to
-it).
+**Vault format version: 4.** This version always writes version 4, and still reads version 1
+through 3 (the readable set only grows). A version 4 group record is a name plus an ordered list
+of child nodes, and an entry may carry an icon; the flat groups of versions 1-3 are read as named
+groups under the top group. An older application reading a version 4 file gets a clear
+"unsupported version" error; **the one exception** is the version 1 parser, which reports
+trailing bytes (the 32-byte master key check value looks like extra content to it).
 
-**Sync payload version: 3.** A payload only accepts the current version, so **any sync
-between 0.1.x and 0.2.0 fails**, with a version error rather than an authentication failure
-(the version sits in the cleartext header, so it is readable without the key). Both devices
-have to be upgraded together, which is deliberate: without the version bump an older device
-would read an mOTP entry as an ordinary TOTP and silently lose the PIN and the step.
+**Sync payload version: 4.** A payload only accepts the current version, so **syncing 0.2.x with
+0.3.0 fails**, with a version error rather than an authentication failure (the version sits in the
+cleartext header, so it is readable without the key). Both devices have to be upgraded together,
+which is deliberate: the entry plaintext grew an icon node, the group plaintext changed shape, and
+the length prefix is now u32.
 
 Importing an Aegis export:
 
@@ -182,13 +183,14 @@ for entry in &report.entries {
 let matches = import::apply::compare(&report, &vault);
 ```
 
-Exporting to one of the same four forms (`Text` / `Json` / `EncryptedJson` / `Html`):
+Exporting to one of six forms - the two `.q2fa` containers (`Vault` / `EncryptedVault`) and the four external ones (`Text` / `Json` / `EncryptedJson` / `Html`):
 
 ```rust
 use qualia2fa_core::export::{self, ExportFormat};
 
 // Bytes out of bytes in, again: this library does no I/O, and where the file goes is the
-// caller's decision. Only EncryptedJson takes a password; the other three are **plaintext**
+// caller's decision. Only EncryptedJson and EncryptedVault take a password; Vault holds the
+// master key in clear, and the other plaintext forms are as sensitive as the vault itself.
 // and as sensitive as the vault itself.
 let bytes = export::export(vault, ExportFormat::EncryptedJson, Some(b"password"))?;
 ```
