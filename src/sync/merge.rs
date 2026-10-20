@@ -30,8 +30,8 @@
 //! | entry | nothing | local entry kept (the peer simply does not have it) |
 //! | nothing | entry / tombstone | accepted |
 //! | group | nothing | accepted |
-//! | group | group with the same ID, same name, position and shared relative order | nothing to do |
-//! | group | group with the same ID that arranges a shared entry differently | **conflict**: the user picks one whole arrangement |
+//! | group | group with the same ID, same name and same shared relative order | nothing to do |
+//! | group | group with the same ID that arranges a shared child differently | **conflict**: the user picks one whole arrangement |
 //!
 //! The tombstone is what makes a deletion synchronizable: in a plain union "this entry does
 //! not exist here" and "this entry was deleted" are the **same observation**, both showing
@@ -60,7 +60,7 @@
 use std::collections::BTreeMap;
 
 use crate::Result;
-use crate::vault::{Entry as VaultEntry, EntryId, Group, GroupId, Tombstone, Vault};
+use crate::vault::{Entry as VaultEntry, EntryId, Group, GroupChild, GroupId, Tombstone, Vault};
 
 /// A record received from a peer, together with its identifier.
 ///
@@ -311,9 +311,10 @@ pub fn merge_into<'a>(
             merge_group(vault, id, group, &mut outcome);
         }
     }
-    // The same rule the file parser applies: an entry no group claims belongs to the top group.
+    // The same rule the file parser applies: a child no group claims belongs to the top group.
     // Without it an entry arriving in a payload that carries no group record - or whose group
-    // record lost the id - would exist in the vault and appear nowhere.
+    // record lost the id - would exist in the vault and appear nowhere, and an inserted group
+    // would have no parent list to hang from.
     //
     // The order is the peer's: its top group lists the entries it sent in the arrangement it
     // wants, and appending them in the order the *records* happened to appear would put them
@@ -324,7 +325,7 @@ pub fn merge_into<'a>(
         if let MergedRecord::Group { id, group } = record
             && id.is_top()
         {
-            claim_order.extend(group.entry_ids.iter().copied());
+            claim_order.extend(group.entry_ids());
         }
     }
     for entry_id in &arrived {
@@ -332,7 +333,11 @@ pub fn merge_into<'a>(
             claim_order.push(*entry_id);
         }
     }
-    vault.adopt_unclaimed_entries(&claim_order);
+    // One pass over the whole tree: it repairs duplicate references, attaches a group that
+    // arrived without the parent list that names it, and places unclaimed entries - the same
+    // rules the file parser applies, so a merged vault is indistinguishable from one read from
+    // disk.
+    vault.rebuild_tree(&claim_order, &[]);
 
     Ok(outcome)
 }
@@ -345,21 +350,29 @@ pub fn merge_into<'a>(
 ///
 /// # What counts as a disagreement
 ///
-/// The name and the position must match, and so must the **relative order of the entries both
-/// sides hold**. An entry only one side lists says nothing about the other's arrangement - it
-/// cannot have been placed there by the other device - so it is not a disagreement: the merge
-/// keeps the local arrangement and the arriving entry is appended to the top group (see
-/// [`crate::vault::Vault::adopt_unclaimed_entries`]).
+/// The names must match, and so must the **relative order of the children both sides list** -
+/// entries and child groups alike. A child only one side lists says nothing about the other's
+/// arrangement - it cannot have been placed there by the other device - so it is not a
+/// disagreement: the merge keeps the local arrangement and the arriving child is placed by the
+/// tree repair that follows (see [`crate::vault::Vault::rebuild_tree`]).
 ///
 /// The stricter rule "the lists must be identical" was tried first and made **every** first sync
 /// between two devices a conflict: each device has appended its own entries to the top group, so
-/// the two lists differ by exactly the entries the other side had never seen. What the user can
-/// actually disagree about is where an entry goes **relative to the others they both have**, and
+/// the two lists differ by exactly the children the other side had never seen. What the user can
+/// actually disagree about is where a child goes **relative to the others they both have**, and
 /// that is what is compared here.
 ///
 /// The consequence, stated rather than hidden: two devices that each had private entries keep
-/// their own placement of those. They converge on the entries they share, which is the part
+/// their own placement of those. They converge on the children they share, which is the part
 /// either of them could have an opinion about.
+///
+/// # Moving a group can produce two conflicts
+///
+/// Moving a group between parents rewrites two lists - the old parent loses it and the new parent
+/// gains it - and each list is a separate record, so each can be reported. That is a known cost
+/// of keeping the merge at one record per group; the interface groups conflicts of the same
+/// group together. Whatever order the two are adjudicated in, the tree is the same afterwards,
+/// because [`crate::vault::Vault::set_children`] allows one parent per child.
 ///
 /// Returns no `Result`: a group holds no secret material, so nothing here can fail.
 fn merge_group(vault: &mut Vault, id: &GroupId, incoming: &Group, outcome: &mut MergeOutcome) {
@@ -371,10 +384,7 @@ fn merge_group(vault: &mut Vault, id: &GroupId, incoming: &Group, outcome: &mut 
         return;
     };
 
-    if local.name == incoming.name
-        && local.group_order == incoming.group_order
-        && !orderings_disagree(&local.entry_ids, &incoming.entry_ids)
-    {
+    if local.name == incoming.name && !children_disagree(&local.children, &incoming.children) {
         outcome.unchanged += 1;
         return;
     }
@@ -387,15 +397,15 @@ fn merge_group(vault: &mut Vault, id: &GroupId, incoming: &Group, outcome: &mut 
     });
 }
 
-/// Whether two orderings place the entries they **both** list differently.
+/// Whether two child lists place the children they **both** list differently.
 ///
-/// Both lists are reduced to the identifiers they have in common - the only ones either side can
-/// have an opinion about - and the two reductions are compared. One entry alone is always "in the
-/// same order as itself", so a difference in the set of entries is never reported here.
-fn orderings_disagree(local: &[EntryId], incoming: &[EntryId]) -> bool {
-    let shared = |list: &[EntryId]| -> Vec<EntryId> {
+/// Both lists are reduced to the references they have in common - the only ones either side can
+/// have an opinion about - and the two reductions are compared. One child alone is always "in the
+/// same order as itself", so a difference in the set of children is never reported here.
+fn children_disagree(local: &[GroupChild], incoming: &[GroupChild]) -> bool {
+    let shared = |list: &[GroupChild]| -> Vec<GroupChild> {
         list.iter()
-            .filter(|entry_id| incoming.contains(entry_id))
+            .filter(|child| incoming.contains(child))
             .copied()
             .collect()
     };

@@ -47,6 +47,10 @@
 //! - Mode 2: insert the input as the **record ciphertext** into a valid skeleton.
 //!   The input then enters the parsing loop of `decode_entry`, after passing (or
 //!   failing) authentication.
+//! - Mode 3: parse the input as a portable `.q2fa` container, and parse it again
+//!   wrapped in a valid plain-container header. There the two length fields come
+//!   from the file, and the arithmetic around them is the part a crafted small file
+//!   can get wrong.
 //!
 //! Mode 2 is the main reason the target exists — "skip unknown nodes" in
 //! `decode_entry` is the whole implementation of forward compatibility, and the
@@ -88,7 +92,44 @@ fuzz_target!(|data: &[u8]| {
 
     // ── Mode 2: the input as the record ciphertext of a valid skeleton ──────
     check_embedded_record(&master, data);
+
+    // ── Mode 3: the input as a portable container, and inside one ───────────
+    check_portable(data);
+    check_wrapped_portable(data);
 });
+
+/// Parses the input as a portable `.q2fa` container.
+///
+/// Every length in that container is read from the file, so this covers "the declared payload
+/// does not match the file", "the declared payload is larger than the limit" and "the header is
+/// shorter than it claims" — none of which may panic or allocate what the header asks for.
+fn check_portable(data: &[u8]) {
+    if let Ok(parsed) = qualia2fa_core::portable::parse(data) {
+        let _ = parsed.kind();
+        let _ = parsed.vault();
+    }
+}
+
+/// Wraps the input in a well-formed plain container header and parses that.
+///
+/// The header is valid by construction, so the fuzz input reaches the length arithmetic instead
+/// of being rejected at the magic; a random input never gets that far on its own.
+fn check_wrapped_portable(data: &[u8]) {
+    let mut file = Vec::with_capacity(
+        qualia2fa_core::portable::PLAIN_HEADER_LEN + data.len(),
+    );
+    file.extend_from_slice(qualia2fa_core::portable::PLAIN_MAGIC);
+    file.push(qualia2fa_core::portable::VERSION);
+    file.push(0);
+    file.extend_from_slice(&[0x11_u8; vault::MASTER_KEY_LEN]);
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    file.extend_from_slice(&len.to_be_bytes());
+    file.extend_from_slice(data);
+
+    if let Ok(parsed) = qualia2fa_core::portable::parse(&file) {
+        let _ = parsed.vault();
+    }
+}
 
 /// Parses a byte string and, on success, verifies the round-trip.
 fn check_file(master: MasterKey, data: &[u8]) {

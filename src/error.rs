@@ -487,25 +487,47 @@ pub enum Error {
     #[error("the top group cannot be renamed, removed or reordered")]
     VaultTopGroupImmutable,
 
-    /// One group holds more identifiers than the format can carry.
+    /// One group holds more child references than the format can carry.
     ///
     /// The list travels in a single length-prefixed node, so it is bounded by
-    /// [`Error::FieldTooLong`]'s limit divided by the identifier length.
-    #[error("a group holds {actual} entries, at most {limit} fit in the format")]
-    VaultGroupTooManyEntries {
+    /// [`Error::FieldTooLong`]'s limit divided by the size of one child reference.
+    #[error("a group holds {actual} children, at most {limit} fit in the format")]
+    VaultGroupTooManyChildren {
         /// The maximum the format allows.
         limit: usize,
         /// How many were supplied.
         actual: usize,
     },
 
-    /// One entry holds two positions in the same ordering.
+    /// One child holds two positions in the same ordering.
     ///
-    /// A list is a **sequence**: the same entry cannot come both before and after another one.
-    /// Two different groups holding the same entry is a different question, and the vault
-    /// answers it by moving the entry instead of refusing.
-    #[error("an entry appears twice in the same ordering")]
-    VaultGroupDuplicateEntry,
+    /// A list is a **sequence**: the same entry or group cannot come both before and after
+    /// another one. Two different groups holding the same child is a different question, and
+    /// the vault answers it by moving the child instead of refusing.
+    #[error("a child appears twice in the same ordering")]
+    VaultGroupDuplicateChild,
+
+    /// Moving the children would put a group inside itself.
+    ///
+    /// The tree has no cycles by definition: "the parent of A is B" and "the parent of B is A"
+    /// cannot both hold. Offering such a list is refused before anything is written, rather
+    /// than left for a traversal to discover - a cycle makes every walk over the tree either
+    /// loop forever or need a visited set, and the one place to prevent it is where the list
+    /// is set.
+    #[error("the children would put a group inside itself")]
+    VaultGroupCycle,
+
+    /// A group would be nested more deeply than the tree allows.
+    ///
+    /// The top group is depth zero. Past the limit the interface has no room to indent a group,
+    /// so the nesting is refused when a list is written and repaired when a file is read.
+    #[error("a group would be nested {actual} levels deep, at most {limit} are allowed")]
+    VaultGroupDepthExceeded {
+        /// The deepest nesting this library allows.
+        limit: usize,
+        /// How deep the operation would place the group.
+        actual: usize,
+    },
 
     /// The export is larger than this library reads.
     ///
@@ -645,6 +667,57 @@ pub enum Error {
         /// Which parameter, in one phrase.
         parameter: &'static str,
     },
+
+    /// A portable vault file (`.q2fa`) does not begin with a magic this library knows.
+    ///
+    /// The three shapes are the plain vault container, the passphrase-protected one, and the
+    /// old key-only recovery file. A caller that expected a backup and got something else is
+    /// told so before any password is asked for.
+    #[error("the file is not a portable vault this library writes")]
+    PortableBadMagic,
+
+    /// A portable vault file declares a container version this library does not read.
+    #[error("the portable vault declares version {version}, which this build does not read")]
+    PortableUnsupportedVersion {
+        /// The version in the file.
+        version: u8,
+    },
+
+    /// A portable vault file ends before the length its header declares.
+    ///
+    /// Checked before the payload is allocated: the length comes from the file and is
+    /// attacker-controlled.
+    #[error("the portable vault is truncated")]
+    PortableTruncated,
+
+    /// A portable vault file is longer or shorter than its lengths add up to.
+    ///
+    /// Refused rather than ignored: trailing bytes mean the file was appended to or assembled
+    /// from parts, and silently reading the first part would hide that.
+    #[error("the portable vault holds content beyond the lengths its header declares")]
+    PortableLengthMismatch,
+
+    /// A portable vault payload is larger than this library accepts.
+    #[error("the portable vault payload is {actual} bytes; at most {limit} are read")]
+    PortableTooLarge {
+        /// The limit.
+        limit: usize,
+        /// The size the header declares.
+        actual: usize,
+    },
+
+    /// The file is a bare vault file, which carries ciphertext but **no master key**.
+    ///
+    /// It looks like a backup and is not one: importing it would replace the local vault with
+    /// ciphertext the local key probably cannot open. The caller is told so it can say what to
+    /// do (export a vault backup instead), rather than leaving the user with a vault that
+    /// cannot be read.
+    #[error("this is a bare vault file and carries no master key")]
+    PortableVaultFileWithoutKey,
+
+    /// A passphrase-protected portable vault was opened without a password.
+    #[error("this portable vault is protected by a passphrase")]
+    PortablePasswordRequired,
 
     /// The plaintext structure of a vault entry contains a duplicated field node.
     ///
@@ -1047,6 +1120,19 @@ pub enum Error {
     /// identifier: telling them apart helps an attacker and has no actionable value for the user.
     #[error("sync payload authentication failed")]
     SyncAuthenticationFailed,
+
+    /// The vault holds entries with icons and the channel cannot carry them.
+    ///
+    /// An icon is a picture of up to 64 KiB, and a channel with a declared message limit (a QR
+    /// code, for instance) cannot hold a payload that carries one. The refusal happens **before
+    /// anything is sealed**, so the user is told "this channel cannot move icons" instead of
+    /// seeing a capacity error that says nothing about icons, and the icon is never silently
+    /// dropped: a sync that quietly loses what the user sees is worse than one that is refused.
+    ///
+    /// The fix is not to shrink the icon here: the byte-stream channel (a LAN connection) has no
+    /// message limit and carries the vault as it is.
+    #[error("this channel cannot carry entries with icons; use a connection without a size limit")]
+    SyncIconRequiresByteTransport,
 
     /// This sync payload has already been processed.
     ///

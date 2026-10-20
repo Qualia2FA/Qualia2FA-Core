@@ -13,7 +13,18 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! Writing the vault out in a form another authenticator can read.
+//! Writing the vault out in a form that can be read again somewhere else.
+//!
+//! # Two kinds of export, and they are not interchangeable
+//!
+//! - **A portable vault** ([`ExportFormat::Vault`], [`ExportFormat::EncryptedVault`]) is this
+//!   application's own backup: the master key and the whole encrypted vault, in one `.q2fa`
+//!   file. It restores everything - entries, the group **tree**, the icons - on a clean device.
+//! - **An export for another authenticator** ([`ExportFormat::Text`], [`ExportFormat::Json`],
+//!   [`ExportFormat::EncryptedJson`], [`ExportFormat::Html`]) is written in the shapes the
+//!   reference implementation reads. What each of them can carry is stated by
+//!   [`ExportFormat::group_carrying`]: the text and HTML forms have no group at all, and even
+//!   the JSON forms carry only one flat level of group names, not the nesting.
 //!
 //! # The formats are the reference implementation's, not this library's
 //!
@@ -21,24 +32,20 @@
 //! rather than by what would be convenient here: the JSON object, the table of the HTML
 //! export, the one-URI-per-line text file and the `motp:` form of an mOTP URI are all the
 //! shapes the reference implementation writes and reads. Nothing is added, and nothing is
-//! renamed.
-//!
-//! **One consequence is deliberate**: the `icon` field of a JSON entry is written as `null`
-//! rather than as a picture. This library does not store icons (they are dropped at import,
-//! see [`crate::import`]), and inventing one - or writing a placeholder - would put a value
-//! in the field that means "there was an icon" to every reader.
+//! renamed. In particular the icon fields of the JSON export are `icon` (base64), `icon_mime`
+//! and `icon_hash`, exactly as the reference format spells them.
 //!
 //! # An export round trips through this library's own reader
 //!
-//! Every format here has a reader in [`crate::import`], and each writer's tests walk the whole
-//! way: vault → file → reader → entry by entry comparison. That is the property that matters,
-//! because the two halves were written against the same document and a shared misunderstanding
-//! would otherwise stay invisible.
+//! Every external format here has a reader in [`crate::import`], and each writer's tests walk the
+//! whole way: vault → file → reader → entry by entry comparison. That is the property that
+//! matters, because the two halves were written against the same document and a shared
+//! misunderstanding would otherwise stay invisible.
 //!
 //! What the round trip cannot preserve is what a format does not carry: the text and HTML
-//! exports have no field for the groups or for the ordering, and neither has one for the
-//! account name (a URI carries it in the label). Each writer's documentation says which
-//! fields survive and which do not.
+//! exports have no field for the groups or for the ordering, neither has one for the account
+//! name (a URI carries it in the label), and the JSON forms lose the nesting. Each writer's
+//! documentation says which fields survive and which do not.
 //!
 //! # Nothing about an entry appears in an error
 //!
@@ -47,9 +54,16 @@
 //!
 //! # The vault is not modified
 //!
-//! Every entry point takes `&Vault` and returns the file's bytes; the caller writes them
-//! wherever it likes. This library has no I/O (see the crate documentation), and an export is
-//! not an exception.
+//! Every entry point takes a `&Vault` or a `&VaultFile` and returns the file's bytes; the caller
+//! writes them wherever it likes. This library has no I/O (see the crate documentation), and an
+//! export is not an exception.
+//!
+//! # The plain `.q2fa` container holds the master key in clear
+//!
+//! That is what lets it restore an account without the old device or a passphrase. It also means
+//! the file is as sensitive as every secret in the vault, and the interface must say so. This
+//! library cannot make the format safer than it is; it only refuses to write it silently under
+//! another name.
 
 pub mod html;
 pub mod json;
@@ -58,17 +72,26 @@ pub mod text;
 
 use std::collections::HashSet;
 
-use crate::vault::{Entry, EntryId, Group, GroupId, Vault};
+use crate::vault::{Entry, EntryId, Group, GroupId, Vault, VaultFile};
 use crate::{Error, Result};
 
 /// An export format this library writes.
 ///
-/// The four are the reference implementation's own set: three files plus the encrypted form of
-/// the JSON one. Which one a caller offers is a user interface question; the difference that
-/// matters to the library is [`ExportFormat::needs_password`] and whether the format can carry
-/// the groups.
+/// The six are the interface's numbered choices, in the order the interface offers them: the two
+/// `.q2fa` containers first, then the four shapes another authenticator reads. Which one a
+/// caller offers is a user interface question; the differences that matter to the library are
+/// [`ExportFormat::needs_password`] and [`ExportFormat::group_carrying`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
+    /// A plain `.q2fa`: the master key in clear plus the whole vault ciphertext.
+    ///
+    /// This is the format that restores an account on a clean device. Whoever holds the file
+    /// holds the master key, which is why the interface warns about it more strongly than about
+    /// the encrypted form.
+    Vault,
+    /// A passphrase-protected `.q2fa`: the master key wrapped by [`crate::recovery`] plus the
+    /// whole vault ciphertext.
+    EncryptedVault,
     /// The text export: one `otpauth://` URI per line.
     Text,
     /// The JSON export, readable as it stands.
@@ -79,11 +102,52 @@ pub enum ExportFormat {
     Html,
 }
 
+/// How much of the group tree a format can carry.
+///
+/// A boolean is too coarse: the Aegis JSON carries the group **names and memberships** but not
+/// the nesting, so a caller that offered it as "keeps your groups" would be saying something
+/// false. The interface labels each format from this answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupCarrying {
+    /// The format has nowhere to put a group.
+    None,
+    /// The format carries the named groups and which entry belongs to which, as one flat level.
+    FlatGroups,
+    /// The format carries the whole tree: parents, nesting and the mixed order of children.
+    FullTree,
+}
+
+impl GroupCarrying {
+    /// Whether the format carries anything about groups.
+    #[must_use]
+    pub const fn carries_anything(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether the format keeps the nesting.
+    #[must_use]
+    pub const fn carries_nesting(self) -> bool {
+        matches!(self, Self::FullTree)
+    }
+}
+
 impl ExportFormat {
+    /// Every format, in the order the interface offers them.
+    pub const ALL: [Self; 6] = [
+        Self::Vault,
+        Self::EncryptedVault,
+        Self::Text,
+        Self::Json,
+        Self::EncryptedJson,
+        Self::Html,
+    ];
+
     /// The name used in messages and diagnostics.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Vault => "vault",
+            Self::EncryptedVault => "encrypted vault",
             Self::Text => "text",
             Self::Json => "JSON",
             Self::EncryptedJson => "encrypted JSON",
@@ -93,11 +157,13 @@ impl ExportFormat {
 
     /// The file name extension this format is normally written with.
     ///
-    /// Both JSON formats share one: they are the same file with and without a password, and a
-    /// reader tells them apart by the `db` field being a string rather than an object.
+    /// Both JSON forms share one: they are the same file with and without a password, and a
+    /// reader tells them apart by the `db` field being a string rather than an object. Both
+    /// `.q2fa` forms share one for the same reason: they are told apart by their magic.
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
+            Self::Vault | Self::EncryptedVault => "q2fa",
             Self::Text => "txt",
             Self::Json | Self::EncryptedJson => "json",
             Self::Html => "html",
@@ -110,27 +176,40 @@ impl ExportFormat {
     /// than calling and handling [`Error::ExportPasswordRequired`].
     #[must_use]
     pub const fn needs_password(self) -> bool {
-        matches!(self, Self::EncryptedJson)
+        matches!(self, Self::EncryptedVault | Self::EncryptedJson)
     }
 
-    /// Whether this format carries the groups and the order inside them.
-    ///
-    /// Only the JSON formats do: neither a list of URIs nor a table has anywhere to put a
-    /// group. An entry exported to those formats and read back lands in the top group, which is
-    /// a loss of arrangement rather than of data.
+    /// How much of the group tree this format carries.
+    #[must_use]
+    pub const fn group_carrying(self) -> GroupCarrying {
+        match self {
+            Self::Vault | Self::EncryptedVault => GroupCarrying::FullTree,
+            Self::Json | Self::EncryptedJson => GroupCarrying::FlatGroups,
+            Self::Text | Self::Html => GroupCarrying::None,
+        }
+    }
+
+    /// Whether this format carries the groups at all.
     #[must_use]
     pub const fn carries_groups(self) -> bool {
-        matches!(self, Self::Json | Self::EncryptedJson)
+        self.group_carrying().carries_anything()
     }
 }
 
 /// Writes the vault out in one of the formats.
 ///
 /// `password` is the UTF-8 bytes of the password, and is looked at only by
-/// [`ExportFormat::EncryptedJson`]: the derivation consumes bytes, and hashing text would mean
-/// choosing a normalization the format does not specify. A password supplied for one of the
-/// other three is ignored rather than refused, since the caller has already chosen the format
-/// and there is nothing it could open.
+/// [`ExportFormat::EncryptedVault`] and [`ExportFormat::EncryptedJson`]: the derivations consume
+/// bytes, and hashing text would mean choosing a normalization the format does not specify. A
+/// password supplied for any other format is ignored rather than refused, since the caller has
+/// already chosen the format and there is nothing it could open.
+///
+/// # It takes the whole vault file, not only its contents
+///
+/// The two `.q2fa` containers carry the **master key** beside the ciphertext, so the export
+/// cannot be written from the decrypted contents alone. Passing the [`VaultFile`] keeps the key
+/// and the contents together, which is also what stops "this file was written with another
+/// key".
 ///
 /// # Errors
 ///
@@ -144,20 +223,54 @@ impl ExportFormat {
 ///   cannot draw it.
 /// - [`Error::FieldTooLong`]: an entry holds a field the file format cannot represent.
 ///   Reachable only for an entry built by hand; the vault's own parser would have refused it.
-pub fn export(vault: &Vault, format: ExportFormat, password: Option<&[u8]>) -> Result<Vec<u8>> {
-    let text = match format {
-        ExportFormat::Text => text::write(vault)?,
-        ExportFormat::Json => json::write(vault)?,
-        ExportFormat::Html => html::write(vault)?,
+/// - [`Error::ExportTooLarge`]: the vault does not fit a portable container.
+/// - [`Error::RandomnessUnavailable`]: a salt or a nonce could not be drawn.
+pub fn export(file: &VaultFile, format: ExportFormat, password: Option<&[u8]>) -> Result<Vec<u8>> {
+    let vault = file.vault();
+    let bytes = match format {
+        ExportFormat::Vault => {
+            // No password: this format is defined as the file that restores without one.
+            portable_bytes(file)?
+        }
+        ExportFormat::EncryptedVault => {
+            let password = password.ok_or(Error::ExportPasswordRequired)?;
+            if password.is_empty() {
+                return Err(Error::ExportPasswordEmpty);
+            }
+            let passphrase =
+                core::str::from_utf8(password).map_err(|_| Error::ExportParameterRefused {
+                    parameter: "the passphrase is not UTF-8",
+                })?;
+            let recovery = crate::recovery::export(
+                file.master_key(),
+                &crate::SecretString::from(passphrase.to_owned()),
+                &crate::recovery::KdfParams::recommended(),
+            )?;
+            let data = file.serialize()?;
+            crate::portable::pack_encrypted(&recovery, &data)?
+        }
+        ExportFormat::Text => text::write(vault)?.into_bytes(),
+        ExportFormat::Json => json::write(vault)?.into_bytes(),
+        ExportFormat::Html => html::write(vault)?.into_bytes(),
         ExportFormat::EncryptedJson => {
             let password = password.ok_or(Error::ExportPasswordRequired)?;
             if password.is_empty() {
                 return Err(Error::ExportPasswordEmpty);
             }
-            json::write_encrypted(vault, password)?
+            json::write_encrypted(vault, password)?.into_bytes()
         }
     };
-    Ok(text.into_bytes())
+    Ok(bytes)
+}
+
+/// Packs the plain `.q2fa` container: the master key in clear plus the vault ciphertext.
+///
+/// # Errors
+///
+/// As [`VaultFile::serialize`] and [`crate::portable::pack_plain`].
+fn portable_bytes(file: &VaultFile) -> Result<Vec<u8>> {
+    let data = file.serialize()?;
+    crate::portable::pack_plain(file.master_key(), &data)
 }
 
 /// One entry, with what the writers need beside it.
@@ -174,9 +287,13 @@ pub(crate) struct Item<'a> {
 
 /// Walks the vault in the order an export writes it.
 ///
-/// The order is the one the user sees: the top group first, then the named groups in their own
-/// order, and inside each group the ordering the vault holds. That is the same walk the
+/// The order is the one the user sees: the tree in pre-order, and inside each group the
+/// arrangement the vault holds - entries and child groups mixed. That is the same walk the
 /// interface performs, which is what makes an exported file look like the application.
+///
+/// Each item's `group` is the **immediate** parent: the Aegis format has one flat level, so an
+/// entry inside a nested group is written as belonging to that group by name. The nesting is
+/// lost there by definition, which is what [`GroupCarrying::FlatGroups`] says.
 ///
 /// # An entry no ordering mentions
 ///
@@ -222,6 +339,11 @@ pub(crate) fn items(vault: &Vault) -> Vec<Item<'_>> {
 ///
 /// The top group is left out: it is not a group a file can name, it is "everything that is in
 /// no named group", and the reference implementation's format has no record for it.
+///
+/// The list is **flat**: a nested group appears beside its parent, and an entry names the group
+/// it is directly in. That is the most the reference format can carry, which is why
+/// [`ExportFormat::Json`] reports [`GroupCarrying::FlatGroups`] and not
+/// [`GroupCarrying::FullTree`].
 pub(crate) fn named_groups(vault: &Vault) -> Vec<(GroupId, &Group)> {
     vault
         .groups()
@@ -401,33 +523,58 @@ mod tests {
     /// of the interface rather than an internal detail.
     #[test]
     fn the_formats_describe_themselves() {
-        let formats = [
-            ExportFormat::Text,
-            ExportFormat::Json,
-            ExportFormat::EncryptedJson,
-            ExportFormat::Html,
-        ];
+        let formats = ExportFormat::ALL;
         let names: Vec<&str> = formats.iter().map(|format| format.name()).collect();
-        assert_eq!(names, vec!["text", "JSON", "encrypted JSON", "HTML"]);
+        assert_eq!(
+            names,
+            vec![
+                "vault",
+                "encrypted vault",
+                "text",
+                "JSON",
+                "encrypted JSON",
+                "HTML"
+            ],
+            "the order is the interface's fixed order"
+        );
 
         let extensions: Vec<&str> = formats.iter().map(|format| format.extension()).collect();
-        assert_eq!(extensions, vec!["txt", "json", "json", "html"]);
         assert_eq!(
-            formats
-                .iter()
-                .filter(|format| format.needs_password())
-                .count(),
-            1,
-            "exactly one format is encrypted"
+            extensions,
+            vec!["q2fa", "q2fa", "txt", "json", "json", "html"]
         );
-        assert!(ExportFormat::EncryptedJson.needs_password());
-        assert!(!ExportFormat::Json.needs_password());
-        assert!(
-            ExportFormat::Json.carries_groups() && ExportFormat::EncryptedJson.carries_groups(),
-            "the two JSON forms carry the groups"
+        let encrypted: Vec<bool> = formats
+            .iter()
+            .map(|format| format.needs_password())
+            .collect();
+        assert_eq!(
+            encrypted,
+            vec![false, true, false, false, true, false],
+            "exactly the two encrypted forms ask for a password"
         );
-        assert!(
-            !ExportFormat::Text.carries_groups() && !ExportFormat::Html.carries_groups(),
+
+        assert_eq!(
+            ExportFormat::Vault.group_carrying(),
+            GroupCarrying::FullTree
+        );
+        assert_eq!(
+            ExportFormat::EncryptedVault.group_carrying(),
+            GroupCarrying::FullTree
+        );
+        assert_eq!(
+            ExportFormat::Json.group_carrying(),
+            GroupCarrying::FlatGroups
+        );
+        assert_eq!(
+            ExportFormat::EncryptedJson.group_carrying(),
+            GroupCarrying::FlatGroups,
+            "the JSON forms keep the group names and memberships, not the nesting"
+        );
+        assert!(!ExportFormat::Json.group_carrying().carries_nesting());
+        assert_eq!(ExportFormat::Text.group_carrying(), GroupCarrying::None);
+        assert_eq!(
+            ExportFormat::Html.group_carrying(),
+            GroupCarrying::None,
             "a list of URIs and a table have nowhere to put a group"
         );
     }
@@ -435,19 +582,14 @@ mod tests {
     /// An empty vault exports in every format without an error.
     ///
     /// A vault with no entries has nothing to write into a list of URIs, so the text export is
-    /// an empty file - that is a legitimate export, not a failure. The other three always have a
+    /// an empty file - that is a legitimate export, not a failure. The others always have a
     /// container to write.
     #[test]
     fn every_format_writes_an_empty_vault() {
-        let vault = Vault::new();
-        for format in [
-            ExportFormat::Text,
-            ExportFormat::Json,
-            ExportFormat::Html,
-            ExportFormat::EncryptedJson,
-        ] {
+        let file = VaultFile::create().expect("OS randomness available");
+        for format in ExportFormat::ALL {
             let password = format.needs_password().then_some(&b"password"[..]);
-            let written = export(&vault, format, password)
+            let written = export(&file, format, password)
                 .unwrap_or_else(|error| panic!("{} must write: {error}", format.name()));
             if format == ExportFormat::Text {
                 assert!(written.is_empty(), "there are no entries to write");
@@ -459,5 +601,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two `.q2fa` containers carry the master key and the vault, and can be unpacked again.
+    #[test]
+    fn the_portable_formats_carry_the_key_and_the_vault() {
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(
+                crate::vault::Entry::new(
+                    "GitHub".into(),
+                    Some("GitHub".into()),
+                    "alice".into(),
+                    crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret"),
+                    crate::otp::Algorithm::Sha1,
+                    crate::otp::Digits::SIX,
+                    crate::vault::EntryKind::Totp { period: 30 },
+                    String::new(),
+                    1_700_000_000,
+                    1_700_000_000,
+                )
+                .expect("valid entry"),
+            )
+            .expect("insertion succeeds");
+
+        let plain =
+            export(&file, ExportFormat::Vault, None).expect("the plain form needs no password");
+        assert_eq!(&plain[..8], crate::portable::PLAIN_MAGIC);
+        let parsed = crate::portable::parse(&plain).expect("it parses");
+        assert_eq!(parsed.kind(), crate::portable::PortableKind::PlainVault);
+        let vault_bytes = parsed.vault().expect("it carries the vault");
+        let reopened = VaultFile::parse(
+            crate::vault::MasterKey::from_bytes(crate::vault::master_key_to_bytes(
+                file.master_key(),
+            ))
+            .expect("the length is correct"),
+            vault_bytes,
+        )
+        .expect("the vault opens with the key the container carried");
+        assert_eq!(reopened.vault().len(), 1);
+
+        let encrypted = export(&file, ExportFormat::EncryptedVault, Some(b"password"))
+            .expect("the encrypted form takes a password");
+        assert_eq!(&encrypted[..8], crate::portable::ENCRYPTED_MAGIC);
+        let parsed = crate::portable::parse(&encrypted).expect("it parses");
+        assert_eq!(parsed.kind(), crate::portable::PortableKind::EncryptedVault);
+        assert!(parsed.vault().is_some());
+
+        assert!(matches!(
+            export(&file, ExportFormat::EncryptedVault, None),
+            Err(Error::ExportPasswordRequired)
+        ));
+        assert!(matches!(
+            export(&file, ExportFormat::EncryptedVault, Some(b"")),
+            Err(Error::ExportPasswordEmpty)
+        ));
     }
 }

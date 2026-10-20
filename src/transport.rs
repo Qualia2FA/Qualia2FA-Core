@@ -476,6 +476,7 @@ impl<'a> SyncSession<'a> {
     ) -> Result<SyncId> {
         let payload = match kind {
             PayloadKind::Vault => {
+                self.ensure_icons_can_travel(transport)?;
                 Payload::from_vault(self.master, transport.local_device(), self.vault)?
             }
             PayloadKind::Request => Payload::request(transport.local_device())?,
@@ -485,6 +486,25 @@ impl<'a> SyncSession<'a> {
         transport.capabilities().check_fits(sealed.len())?;
         transport.send(to, &sealed)?;
         Ok(payload.sync_id)
+    }
+
+    /// Refuses a channel that cannot carry icons when the vault holds any.
+    ///
+    /// An icon is up to 64 KiB, and a channel with a declared message limit (a QR code, for
+    /// instance) either cannot hold the payload at all or would only fit by dropping the picture.
+    /// The check is **before sealing** and before the capacity check, so the user is told what is
+    /// actually wrong: "this channel cannot move icons", not "the payload is too large". The
+    /// error is named rather than a silent drop because a sync that quietly loses what the user
+    /// sees is worse than one that is refused.
+    ///
+    /// A channel with no message limit (a LAN connection) carries the vault as it is.
+    fn ensure_icons_can_travel(&self, transport: &dyn Transport) -> Result<()> {
+        if transport.capabilities().max_message_len.is_some()
+            && self.vault.iter().any(|(_, entry)| entry.has_icon())
+        {
+            return Err(Error::SyncIconRequiresByteTransport);
+        }
+        Ok(())
     }
 
     /// Plans which route this share takes; the answer is known **before** anything is
@@ -512,6 +532,7 @@ impl<'a> SyncSession<'a> {
     /// Exactly the sealing step of [`SyncSession::send`], see [`Payload::from_vault`] and
     /// [`Payload::seal`].
     pub fn plan_share(&self, transport: &dyn Transport) -> Result<SharePlan> {
+        self.ensure_icons_can_travel(transport)?;
         let payload = Payload::from_vault(self.master, transport.local_device(), self.vault)?;
         let sealed = payload.seal(self.master)?;
         Ok(match transport.capabilities().max_message_len {
@@ -599,7 +620,9 @@ mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::sync::{RecordSet, merge_into};
-    use crate::vault::{Entry, EntryId, EntryKind, Timestamp, Vault as VaultAlias};
+    use crate::vault::{
+        Entry, EntryIcon, EntryId, EntryKind, GroupChild, IconMime, Timestamp, Vault as VaultAlias,
+    };
 
     /// An in-memory channel used to exercise the protocol without a network.
     ///
@@ -782,6 +805,66 @@ mod tests {
         assert!(
             matches!(again, Err(Error::SyncAlreadyApplied)),
             "a duplicate payload was not rejected, got {again:?}"
+        );
+    }
+
+    /// The group tree and the icons travel with the entries: two devices that sync hold the
+    /// same parents, the same mixed order and the same pictures.
+    #[test]
+    fn a_two_party_exchange_moves_the_tree_and_the_icons() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        let (id_b, _, mut vault_b) = a_device(2);
+        let icon =
+            EntryIcon::new(IconMime::Jpeg, vec![0xFF, 0xD8, 0xFF, 0xE0]).expect("a small icon");
+        let entry = vault_a
+            .insert(
+                sample_entry("inside a nested group", 1_700_000_000).with_icon(Some(icon.clone())),
+            )
+            .expect("random source is available");
+        let work = vault_a
+            .create_group("Work".to_owned())
+            .expect("creation succeeds");
+        let sub = vault_a
+            .create_group_in(&work, "Sub".to_owned())
+            .expect("creation succeeds");
+        vault_a
+            .set_children(
+                &work,
+                vec![GroupChild::Group(sub), GroupChild::Entry(entry)],
+            )
+            .expect("the list is valid");
+        let expected_children = vault_a.children_of(&work).expect("it exists").to_vec();
+
+        let caps = TransportCapabilities::stream(Roster::TwoParty);
+        let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
+        let tb = MemoryTransport::new(id_b, caps).with_peers(vec![id_a]);
+        let mut seen_a = SeenSyncIds::new();
+        let mut seen_b = SeenSyncIds::new();
+
+        SyncSession::open(&master, &mut vault_a, &mut seen_a)
+            .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
+            .expect("send");
+        ta.deliver_to(&tb, true);
+        let outcome = SyncSession::open(&master, &mut vault_b, &mut seen_b)
+            .receive(&tb)
+            .expect("receive");
+
+        assert!(
+            !outcome.needs_adjudication(),
+            "a first sync of a consistent tree must not be a conflict: {outcome}"
+        );
+        assert_eq!(
+            vault_b.children_of(&work).map(|children| children.to_vec()),
+            Some(expected_children),
+            "the mixed order of entries and child groups survives"
+        );
+        assert_eq!(vault_b.parent_of(&sub), Some(work));
+        assert_eq!(vault_b.depth_of(&sub), Some(2));
+        assert_eq!(vault_b.group_of(&entry), Some(&work));
+        assert_eq!(
+            vault_b.get(&entry).and_then(|entry| entry.icon.clone()),
+            Some(icon),
+            "the picture travels inside the entry record"
         );
     }
 
@@ -1297,6 +1380,42 @@ mod tests {
             !plan.needs_link(),
             "a byte-stream channel must not require a link: {plan}"
         );
+    }
+
+    /// An entry with an icon travels only over a channel **without** a message limit.
+    ///
+    /// A QR code cannot carry a 64 KiB picture (and a multi-frame code that "fits" only by
+    /// dropping the icon would silently lose what the user sees). The refusal happens before
+    /// anything is sealed and names the icon, so the user is not told "too large" for a payload
+    /// whose real problem is a picture.
+    #[test]
+    fn a_limited_channel_refuses_entries_with_icons() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        let icon =
+            EntryIcon::new(IconMime::Png, vec![0x89, b'P', b'N', b'G']).expect("a small icon");
+        vault_a
+            .insert(sample_entry("with icon", 1_700_000_000).with_icon(Some(icon)))
+            .expect("random source is available");
+
+        let limited = MemoryTransport::new(id_a, TransportCapabilities::qr(40, 4096));
+        let stream = MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::TwoParty));
+        let mut seen = SeenSyncIds::new();
+        let session = SyncSession::open(&master, &mut vault_a, &mut seen);
+
+        let sent = session.send(&limited, Recipient::All, PayloadKind::Vault);
+        assert!(
+            matches!(sent, Err(Error::SyncIconRequiresByteTransport)),
+            "actual {sent:?}"
+        );
+        let planned = session.plan_share(&limited);
+        assert!(
+            matches!(planned, Err(Error::SyncIconRequiresByteTransport)),
+            "planning must give the same answer before the user confirms: {planned:?}"
+        );
+
+        session
+            .send(&stream, Recipient::All, PayloadKind::Vault)
+            .expect("a byte-stream channel carries the icon");
     }
 
     /// **The first step of link establishment must actually work.**

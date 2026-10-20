@@ -19,7 +19,16 @@
 //!
 //! After decryption a 2FA entry is carried by [`Entry`]: display name, issuer, account,
 //! secret, algorithm, digits, the entry kind (with the time step, the HOTP counter and any PIN
-//! the scheme needs), note, and the creation and modification timestamps.
+//! the scheme needs), note, the creation and modification timestamps, and an optional icon.
+//!
+//! # The icon is not a secret, and is stored anyway
+//!
+//! [`EntryIcon`] is a picture another authenticator exported beside the entry. It is not key
+//! material, but it is user data: it identifies the account on screen, it travels with the entry
+//! through the vault file, the sync payload and the exports, and dropping it would silently
+//! degrade what the user sees. It is a node of the entry plaintext (see
+//! [`crate::vault::FORMAT_VERSION`]), so the icon of an entry is inside the same ciphertext as
+//! its secret and is not visible in a vault file.
 //!
 //! # What the plaintext does not hold
 //!
@@ -233,6 +242,147 @@ impl EntryKind {
     }
 }
 
+/// The image format of an [`EntryIcon`].
+///
+/// The three are the formats another authenticator's export names in `icon_mime`. The value is
+/// stored as a byte in the entry plaintext, so a format this build does not know is refused at
+/// parse time rather than guessed: a picture shown as a different format is a broken picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconMime {
+    /// `image/png`.
+    Png,
+    /// `image/jpeg`.
+    Jpeg,
+    /// `image/svg+xml`.
+    Svg,
+}
+
+impl IconMime {
+    /// The media type as an export spells it.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Svg => "image/svg+xml",
+        }
+    }
+
+    /// Parses an export's spelling of a media type, case-insensitively.
+    ///
+    /// Only the three formats this library stores are accepted; `None` means "not an icon we
+    /// keep", and the caller drops the icon rather than the entry.
+    #[must_use]
+    pub fn from_media_type(text: &str) -> Option<Self> {
+        if text.eq_ignore_ascii_case("image/png") {
+            Some(Self::Png)
+        } else if text.eq_ignore_ascii_case("image/jpeg") {
+            Some(Self::Jpeg)
+        } else if text.eq_ignore_ascii_case("image/svg+xml") {
+            Some(Self::Svg)
+        } else {
+            None
+        }
+    }
+
+    /// The storage byte.
+    #[must_use]
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            Self::Png => 0x01,
+            Self::Jpeg => 0x02,
+            Self::Svg => 0x03,
+        }
+    }
+
+    /// The media type of a storage byte, or `None` for a value this build does not know.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Self::Png),
+            0x02 => Some(Self::Jpeg),
+            0x03 => Some(Self::Svg),
+            _ => None,
+        }
+    }
+}
+
+/// The picture an entry shows beside its name.
+///
+/// It is kept as the **original bytes** of the file another authenticator exported, not as
+/// decoded pixels: decoding belongs to the platform that displays it (one platform uses
+/// `BitmapFactory`, another `ImageIO`), and re-encoding here would change bytes the user may
+/// have chosen deliberately. SVG is stored and exported unchanged even though this version does
+/// not render it.
+///
+/// # Size
+///
+/// The bytes travel in one vault node, so they are bounded by
+/// [`Entry::MAX_FIELD_LEN`] minus the one byte of media type. An import that exceeds the bound
+/// drops the icon and keeps the entry: losing a picture must not lose a 2FA configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EntryIcon {
+    /// The format the bytes are in.
+    pub mime: IconMime,
+    /// The original file bytes, not base64.
+    pub bytes: Vec<u8>,
+}
+
+impl EntryIcon {
+    /// Maximum number of icon bytes, excluding the media-type byte.
+    pub const MAX_BYTES: usize = Entry::MAX_FIELD_LEN - 1;
+
+    /// Builds an icon, checking the size bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FieldTooLong`] when the bytes exceed [`EntryIcon::MAX_BYTES`].
+    pub fn new(mime: IconMime, bytes: Vec<u8>) -> Result<Self> {
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(Error::FieldTooLong {
+                field: "icon",
+                limit: Self::MAX_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self { mime, bytes })
+    }
+
+    /// `SHA-256(media type || bytes)`, the value another authenticator's export calls
+    /// `icon_hash`.
+    ///
+    /// It is **not stored**: two copies would give the hash and the bytes a chance to disagree,
+    /// and the hash is derived from what is stored anyway. It is computed when an export writes
+    /// it, and checked once when an import reads one - not as a security property, only to
+    /// notice a damaged or mismatched picture.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(self.mime.media_type().as_bytes());
+        hasher.update(&self.bytes);
+        let digest = hasher.finalize();
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+}
+
+impl core::fmt::Debug for EntryIcon {
+    /// Prints the format and the length, never the bytes.
+    ///
+    /// The bytes are not a secret, but printing a whole picture into a log or an error message
+    /// is useless and can carry the service's logo with it. A length is what a reader needs to
+    /// tell "there is an icon" from "there is not".
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EntryIcon")
+            .field("mime", &self.mime)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// One decrypted 2FA entry.
 ///
 /// Every field is public. This is a plain data carrier with no invariant that
@@ -293,10 +443,22 @@ pub struct Entry {
     pub created_at: Timestamp,
     /// Last modification time (Unix seconds).
     pub updated_at: Timestamp,
+    /// Icon shown beside the name, when the entry came from an export that carried one.
+    ///
+    /// Not a parameter of [`Entry::new`]: an entry created from a URI or typed in has no icon,
+    /// and a mandatory parameter would make every call site spell out `None`. The two ways to
+    /// set one are [`Entry::with_icon`] and [`Entry::set_icon`].
+    pub icon: Option<EntryIcon>,
 }
 
 impl PartialEq for Entry {
     /// Compares field by field, with the secret compared in constant time.
+    ///
+    /// # The icon takes part
+    ///
+    /// Two entries that differ only in their icon are different entries: the user sees the
+    /// difference, and the sync merge decides "unchanged" from this comparison. Leaving the
+    /// icon out would make "only the icon changed" invisible and the change would never travel.
     ///
     /// # The order is deliberate
     ///
@@ -316,6 +478,7 @@ impl PartialEq for Entry {
             && self.algorithm == other.algorithm
             && self.digits == other.digits
             && self.kind == other.kind
+            && self.icon == other.icon
             && self.secret == other.secret
     }
 }
@@ -458,7 +621,34 @@ impl Entry {
             note,
             created_at,
             updated_at,
+            icon: None,
         })
+    }
+
+    /// Returns this entry with the given icon.
+    ///
+    /// The counterpart of [`Entry::new`] keeping its ten parameters: an icon is optional, and a
+    /// required parameter would make every call site that builds an entry from a URI spell out
+    /// `None`. The icon is checked by [`EntryIcon::new`], so a value of this type fits the
+    /// format.
+    #[must_use]
+    pub fn with_icon(mut self, icon: Option<EntryIcon>) -> Self {
+        self.icon = icon;
+        self
+    }
+
+    /// Replaces the icon in place. `None` removes it.
+    pub fn set_icon(&mut self, icon: Option<EntryIcon>) {
+        self.icon = icon;
+    }
+
+    /// Whether this entry has an icon.
+    ///
+    /// Used by the sync session to refuse a channel that cannot carry one before anything is
+    /// sealed, and by the export to decide whether an `icon` field is written.
+    #[must_use]
+    pub const fn has_icon(&self) -> bool {
+        self.icon.is_some()
     }
 
     /// The URI type of this entry.

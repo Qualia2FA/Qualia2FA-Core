@@ -209,7 +209,8 @@ fn read_entry(value: &JsonValue, known: &HashSet<GroupId>, now: Timestamp) -> Re
         .copied()
         .unwrap_or(false);
 
-    let (entry, notes) = RawEntry {
+    let (icon, icon_problem) = read_icon(entry);
+    let (entry, mut notes) = RawEntry {
         name: string(entry, "name").unwrap_or_default().to_owned(),
         issuer: string(entry, "issuer")
             .filter(|text| !text.is_empty())
@@ -219,12 +220,12 @@ fn read_entry(value: &JsonValue, known: &HashSet<GroupId>, now: Timestamp) -> Re
         algorithm,
         digits,
         kind,
-        // The icon field is read to know whether there was one; its content is not imported.
-        icon: entry
-            .get("icon")
-            .is_some_and(|value| value.get::<String>().is_some()),
+        icon,
     }
     .into_entry(now)?;
+    if icon_problem {
+        notes.push(crate::import::ImportNote::IconDropped);
+    }
 
     Ok(Read {
         entry,
@@ -232,6 +233,55 @@ fn read_entry(value: &JsonValue, known: &HashSet<GroupId>, now: Timestamp) -> Re
         favorite,
         notes,
     })
+}
+
+/// Reads an entry's icon, or reports that one was there and could not be kept.
+///
+/// The shape is another authenticator's: `icon` is the base64 image, `icon_mime` says which of
+/// three formats it is, and `icon_hash` is `SHA-256(icon_mime || bytes)` in lowercase hex.
+///
+/// # A bad picture never costs the entry
+///
+/// An icon that is not valid base64, has an unknown media type, exceeds the node limit or does
+/// not match its hash **drops the icon only** and reports one note. The rest of the entry is a
+/// perfectly good 2FA configuration, and refusing it would cost the user the account over a
+/// decoration. The hash is not a security check - the file is the user's own export - it only
+/// notices a damaged or mismatched picture.
+///
+/// `(icon, dropped)` where `dropped` is true when there was something that could not be kept.
+fn read_icon(entry: &HashMap<String, JsonValue>) -> (Option<crate::vault::EntryIcon>, bool) {
+    use crate::vault::{EntryIcon, IconMime};
+
+    let Some(icon_value) = entry.get("icon") else {
+        // No field at all: there is no icon to keep.
+        return (None, false);
+    };
+    let Some(encoded) = icon_value.get::<String>() else {
+        // `null` (the usual "no icon") is fine; any other type is a damaged field, which costs
+        // the icon but not the entry.
+        return (None, !icon_value.is_null());
+    };
+    let Some(bytes) = crate::import::decode_base64(encoded) else {
+        return (None, true);
+    };
+    let mime = entry
+        .get("icon_mime")
+        .and_then(|value| value.get::<String>())
+        .and_then(|text| IconMime::from_media_type(text));
+    let Some(mime) = mime else {
+        return (None, true);
+    };
+    let Ok(icon) = EntryIcon::new(mime, bytes) else {
+        return (None, true);
+    };
+    if let Some(expected) = entry
+        .get("icon_hash")
+        .and_then(|value| value.get::<String>())
+        && expected.to_ascii_lowercase() != crate::export::hex(&icon.hash())
+    {
+        return (None, true);
+    }
+    (Some(icon), false)
 }
 
 /// Reads the per-type parameter block.
@@ -538,16 +588,83 @@ mod tests {
         );
     }
 
+    /// A well-formed icon is kept, and no note is reported for it.
     #[test]
-    fn an_icon_is_dropped_and_counted() {
+    fn a_valid_icon_is_kept() {
         let text = SAMPLE.replace(
             r#""favorite": true,"#,
-            r#""favorite": true, "icon": "AAAA", "icon_mime": "image/png","#,
+            r#""favorite": true, "icon": "iVBORw0KGgo=", "icon_mime": "image/png","#,
         );
         let report = import_sample(&text);
         assert_eq!(report.entries.len(), 5);
+        assert_eq!(report.dropped.icons, 0);
+        let icon = report.entries[0]
+            .entry
+            .icon
+            .as_ref()
+            .expect("the icon is kept");
+        assert_eq!(icon.mime, crate::vault::IconMime::Png);
+        assert_eq!(&icon.bytes[..4], b"\x89PNG");
+        assert!(!report.entries[0].has_notes());
+    }
+
+    /// A damaged icon is dropped and counted; the entry itself is still imported.
+    #[test]
+    fn a_bad_icon_costs_the_icon_not_the_entry() {
+        for (replacement, why) in [
+            (
+                r#""favorite": true, "icon": "not base64!", "icon_mime": "image/png","#,
+                "the icon is not base64",
+            ),
+            (
+                r#""favorite": true, "icon": "AAAA", "icon_mime": "image/webp","#,
+                "the media type is not one this library stores",
+            ),
+            (
+                r#""favorite": true, "icon": "AAAA","#,
+                "there is no media type at all",
+            ),
+        ] {
+            let text = SAMPLE.replace(r#""favorite": true,"#, replacement);
+            let report = import_sample(&text);
+            assert_eq!(report.entries.len(), 5, "{why}");
+            assert_eq!(report.dropped.icons, 1, "{why}");
+            assert!(report.entries[0].has_notes(), "{why}");
+            assert!(report.entries[0].entry.icon.is_none(), "{why}");
+        }
+    }
+
+    /// A hash that does not match the bytes drops the icon, and a matching one keeps it.
+    #[test]
+    fn the_icon_hash_is_checked_when_present() {
+        let bytes = b"\x89PNG fixture";
+        let encoded = crate::export::base64(bytes);
+        let icon = crate::vault::EntryIcon::new(crate::vault::IconMime::Png, bytes.to_vec())
+            .expect("small icon");
+        let matching = crate::export::hex(&icon.hash());
+        let good = SAMPLE.replace(
+            r#""favorite": true,"#,
+            &format!(
+                r#""favorite": true, "icon": "{encoded}", "icon_mime": "image/png", "icon_hash": "{matching}","#
+            ),
+        );
+        let report = import_sample(&good);
+        assert_eq!(report.dropped.icons, 0);
+        assert!(report.entries[0].entry.icon.is_some());
+
+        let wrong = SAMPLE.replace(
+            r#""favorite": true,"#,
+            &format!(
+                r#""favorite": true, "icon": "{encoded}", "icon_mime": "image/png", "icon_hash": "{}","#,
+                "00".repeat(32)
+            ),
+        );
+        let report = import_sample(&wrong);
         assert_eq!(report.dropped.icons, 1);
-        assert!(report.entries[0].has_notes());
+        assert!(
+            report.entries[0].entry.icon.is_none(),
+            "a hash that does not match means the picture is not the one the file describes"
+        );
     }
 
     #[test]

@@ -278,7 +278,7 @@ fn read_row(
         // The export has no icon column at all: the image column holds the QR code, which is
         // the same configuration the neighbouring columns already spell out. Nothing is dropped
         // here, so nothing is reported.
-        icon: false,
+        icon: None,
     };
     let (entry, mut notes) = entry.into_entry(now)?;
 

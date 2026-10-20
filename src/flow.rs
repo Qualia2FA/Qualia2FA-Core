@@ -684,6 +684,93 @@ pub fn import_recovery_key(
     Ok(master)
 }
 
+/// What a portable vault file turned out to be, once it has been opened.
+///
+/// The two shapes are kept apart rather than folded into "a vault or an error": the old
+/// key-only file is a legitimate file, and the reason it cannot restore an account on its own is
+/// a **property of the file**, not a failure. The caller decides what to say from this.
+#[derive(Debug)]
+pub enum PortableRestore {
+    /// The master key was written to the platform store and the vault the file carried opened.
+    Vault(crate::vault::VaultFile),
+    /// The file is an old key-only recovery file: it carries the master key but no entries.
+    ///
+    /// Nothing was written: the key is only useful against a vault this device already has, and
+    /// replacing a working key with one that opens nothing is worse than doing nothing. A caller
+    /// that has a local vault may retry with [`import_recovery_key`] on the file's own bytes.
+    KeyOnly,
+}
+
+/// Restores an account from a **portable vault file**: the two `.q2fa` containers.
+///
+/// # What it does, in this order
+///
+/// 1. Split the container into its parts (no cryptography yet).
+/// 2. An old key-only file is reported as [`PortableRestore::KeyOnly`] and **nothing is written**.
+/// 3. Recover the master key: the plain container carries it; the encrypted one is opened with
+///    `passphrase` by [`crate::recovery`].
+/// 4. **Write the master key to the store**, because the vault can only be opened by reading it
+///    back from there.
+/// 5. Parse the vault the container carries.
+///
+/// # Why the key is written before the vault is parsed
+///
+/// There is no transaction across the two stores. The order therefore follows "what is left if
+/// this fails": writing the key first means a failure leaves a vault that was never touched, and
+/// step 5 puts the previous key back (or removes the one just written) so the device does not end
+/// up on a key that opens nothing. The opposite order would leave a vault written under a key that
+/// is not stored anywhere.
+///
+/// # Errors
+///
+/// - [`crate::Error::PortableVaultFileWithoutKey`]: the file is a bare vault file.
+/// - [`crate::Error::PortablePasswordRequired`]: the encrypted container was opened without a
+///   passphrase.
+/// - [`crate::Error::PortableBadMagic`], [`crate::Error::PortableUnsupportedVersion`],
+///   [`crate::Error::PortableTruncated`], [`crate::Error::PortableLengthMismatch`],
+///   [`crate::Error::PortableTooLarge`]: the container is malformed.
+/// - [`crate::Error::RecoveryAuthenticationFailed`]: the passphrase is wrong, or the encrypted
+///   part was modified. The two are deliberately indistinguishable.
+/// - [`crate::Error::VaultDecryptionFailed`]: the master key recovered from the file does not
+///   open the vault the file carries. **The previous key has been put back.**
+pub fn open_portable(
+    file: &[u8],
+    passphrase: &SecretString,
+    store: &mut dyn SecureStore,
+) -> Result<PortableRestore> {
+    use crate::portable::{PortableFile, parse};
+
+    let parsed = parse(file)?;
+    let (master, vault_bytes) = match parsed {
+        PortableFile::KeyOnly { .. } => return Ok(PortableRestore::KeyOnly),
+        PortableFile::PlainVault { master_key, vault } => {
+            (MasterKey::from_bytes(master_key)?, vault)
+        }
+        PortableFile::EncryptedVault { recovery, vault } => {
+            if passphrase.expose_secret().is_empty() {
+                return Err(Error::PortablePasswordRequired);
+            }
+            (crate::recovery::import(&recovery, passphrase)?, vault)
+        }
+    };
+
+    let previous = store.load_master_key()?;
+    store.store_master_key(&master)?;
+
+    match crate::vault::VaultFile::parse(master, &vault_bytes) {
+        Ok(opened) => Ok(PortableRestore::Vault(opened)),
+        Err(error) => {
+            // Put the device back on the key it had. A failure of the rollback itself must not
+            // replace the real diagnosis, which is why its result is deliberately dropped.
+            let _ = match previous {
+                Some(previous) => store.store_master_key(&previous),
+                None => store.delete_master_key(),
+            };
+            Err(error)
+        }
+    }
+}
+
 /// Opens an existing vault, taking the master key from the platform store.
 ///
 /// The result is decidable: [`Error::DeviceNotRegistered`] means this device never
@@ -1629,5 +1716,152 @@ mod tests {
         let direct = keys.get_or_create(LABEL).expect("should succeed");
         assert_eq!(via_ref.as_sec1_bytes(), direct.as_sec1_bytes());
         assert_eq!(keys.creates, 1);
+    }
+
+    /// A vault with one entry and its serialized bytes, for the portable-container tests.
+    fn vault_with_one_entry() -> (VaultFile, Vec<u8>) {
+        let mut file = VaultFile::create().expect("randomness should be available");
+        let entry = crate::vault::Entry::new(
+            "GitHub".into(),
+            Some("GitHub".into()),
+            "alice".into(),
+            crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret"),
+            crate::otp::Algorithm::Sha1,
+            crate::otp::Digits::SIX,
+            crate::vault::EntryKind::Totp { period: 30 },
+            String::new(),
+            1_700_000_000,
+            1_700_000_000,
+        )
+        .expect("the entry is valid");
+        file.vault_mut().insert(entry).expect("the vault is empty");
+        let data = file.serialize().expect("serialization should succeed");
+        (file, data)
+    }
+
+    /// A clean device can restore its account from the **plain** container.
+    #[test]
+    fn a_plain_portable_vault_restores_on_a_clean_device() {
+        let (file, data) = vault_with_one_entry();
+        let packed = crate::portable::pack_plain(file.master_key(), &data).expect("it packs");
+        let mut store = FakeStore::default();
+
+        let restored = open_portable(&packed, &SecretString::from(String::new()), &mut store)
+            .expect("the container is valid");
+        match restored {
+            PortableRestore::Vault(vault) => {
+                assert_eq!(vault.vault().len(), 1, "the entry came along");
+                assert_eq!(
+                    vault.master_key().expose(),
+                    file.master_key().expose(),
+                    "the key the container carried is the one that opened the vault"
+                );
+            }
+            other => panic!("expected a vault, actual {other:?}"),
+        }
+        assert!(
+            store.master.is_some(),
+            "the restored key must be in the platform store"
+        );
+    }
+
+    /// The **encrypted** container needs its passphrase, and a wrong one changes nothing.
+    #[test]
+    fn an_encrypted_portable_vault_needs_the_right_passphrase() {
+        let (file, data) = vault_with_one_entry();
+        let passphrase = SecretString::from("correct horse battery staple".to_owned());
+        let recovery = crate::recovery::export(
+            file.master_key(),
+            &passphrase,
+            &crate::recovery::KdfParams::recommended(),
+        )
+        .expect("the recovery file is written");
+        let packed = crate::portable::pack_encrypted(&recovery, &data).expect("it packs");
+
+        // A wrong passphrase leaves the store untouched and reports authentication failure.
+        let mut store = FakeStore::default();
+        let err = open_portable(&packed, &SecretString::from("wrong".to_owned()), &mut store);
+        assert!(
+            matches!(err, Err(Error::RecoveryAuthenticationFailed)),
+            "actual {err:?}"
+        );
+        assert!(
+            store.master.is_none(),
+            "a failed restore must not write a key"
+        );
+
+        // Omitting the passphrase is refused before any derivation runs.
+        let err = open_portable(&packed, &SecretString::from(String::new()), &mut store);
+        assert!(
+            matches!(err, Err(Error::PortablePasswordRequired)),
+            "actual {err:?}"
+        );
+
+        let restored = open_portable(&packed, &passphrase, &mut store).expect("it opens");
+        assert!(matches!(restored, PortableRestore::Vault(_)));
+    }
+
+    /// A container whose key does not open its vault leaves the **previous** key in place.
+    #[test]
+    fn a_mismatched_portable_vault_rolls_the_key_back() {
+        let other = VaultFile::create().expect("randomness should be available");
+        let (file, _) = vault_with_one_entry();
+        // Container: the vault of `file` under the key of `other`.
+        let data = file.serialize().expect("serialization should succeed");
+        let packed = crate::portable::pack_plain(other.master_key(), &data).expect("it packs");
+
+        let (previous, _) = vault_with_one_entry();
+        let previous_key = MasterKey::from_bytes(master_key_to_bytes(previous.master_key()))
+            .expect("the length is correct");
+        let mut store = FakeStore::default();
+        store
+            .store_master_key(&previous_key)
+            .expect("the write should succeed");
+
+        let err = open_portable(&packed, &SecretString::from(String::new()), &mut store);
+        assert!(
+            matches!(err, Err(Error::VaultDecryptionFailed)),
+            "actual {err:?}"
+        );
+        let kept = store.load_master_key().expect("the store is readable");
+        assert_eq!(
+            kept.map(|key| key.expose().to_vec()),
+            Some(previous_key.expose().to_vec()),
+            "the device must stay on the key it had"
+        );
+    }
+
+    /// The old key-only file is recognized and **writes nothing**.
+    #[test]
+    fn a_key_only_file_is_reported_and_changes_nothing() {
+        let master = MasterKey::generate().expect("randomness should be available");
+        let passphrase = SecretString::from("passphrase".to_owned());
+        let file = crate::recovery::export(
+            &master,
+            &passphrase,
+            &crate::recovery::KdfParams::recommended(),
+        )
+        .expect("the recovery file is written");
+
+        let mut store = FakeStore::default();
+        let restored = open_portable(&file, &passphrase, &mut store).expect("it is a valid file");
+        assert!(matches!(restored, PortableRestore::KeyOnly));
+        assert!(
+            store.master.is_none(),
+            "a key-only file has no entries to restore, so nothing is written"
+        );
+    }
+
+    /// A bare vault file is refused with the diagnosis that says what to export instead.
+    #[test]
+    fn a_bare_vault_file_is_refused_by_the_restore_path() {
+        let (_, data) = vault_with_one_entry();
+        let mut store = FakeStore::default();
+        let err = open_portable(&data, &SecretString::from(String::new()), &mut store);
+        assert!(
+            matches!(err, Err(Error::PortableVaultFileWithoutKey)),
+            "actual {err:?}"
+        );
+        assert!(store.master.is_none());
     }
 }

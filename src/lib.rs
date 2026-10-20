@@ -66,6 +66,7 @@ pub mod import;
 pub mod motp;
 pub mod otp;
 pub mod pairing;
+pub mod portable;
 pub mod recovery;
 mod secret;
 pub mod sync;

@@ -133,8 +133,12 @@ pub(crate) struct RawEntry {
     pub(crate) digits: Option<u8>,
     /// The scheme and its parameters.
     pub(crate) kind: RawKind,
-    /// Whether the export carried an icon for it.
-    pub(crate) icon: bool,
+    /// The icon the export carried, already checked against its format limits.
+    ///
+    /// `None` means "there was no icon, or the one there was could not be kept". The reader is
+    /// what decides which, and what note to report: a bad picture costs the picture, never the
+    /// entry.
+    pub(crate) icon: Option<crate::vault::EntryIcon>,
 }
 
 impl RawEntry {
@@ -165,10 +169,7 @@ impl RawEntry {
     /// [`safe_reason`], so no value from the export reaches the report.
     pub(crate) fn into_entry(self, now: Timestamp) -> Result<(Entry, Vec<ImportNote>)> {
         let uri_type = self.kind.uri_type();
-        let mut notes = Vec::new();
-        if self.icon {
-            notes.push(ImportNote::IconDropped);
-        }
+        let notes = Vec::new();
 
         let algorithm = self.resolve_algorithm()?;
         let digits = self.resolve_digits(uri_type)?;
@@ -179,6 +180,7 @@ impl RawEntry {
             issuer,
             note,
             kind,
+            icon,
             ..
         } = self;
         let kind = resolve_kind(kind, uri_type)?;
@@ -201,7 +203,8 @@ impl RawEntry {
             note,
             now,
             now,
-        )?;
+        )?
+        .with_icon(icon);
         Ok((entry, notes))
     }
 
@@ -316,7 +319,6 @@ pub(crate) fn safe_reason(error: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import::ImportNote;
 
     fn raw(kind: RawKind) -> RawEntry {
         RawEntry {
@@ -327,7 +329,7 @@ mod tests {
             algorithm: Some(RawAlgorithm::Sha1),
             digits: None,
             kind,
-            icon: false,
+            icon: None,
         }
     }
 
@@ -459,12 +461,19 @@ mod tests {
         }
     }
 
+    /// An icon the reader kept is attached to the entry, and produces no note of its own.
     #[test]
-    fn an_icon_is_dropped_with_a_note_rather_than_failing_the_entry() {
+    fn a_kept_icon_reaches_the_entry() {
+        let icon = crate::vault::EntryIcon::new(crate::vault::IconMime::Png, vec![1, 2, 3])
+            .expect("small icon");
         let mut with_icon = raw(RawKind::Totp { period: None });
-        with_icon.icon = true;
-        let (_, notes) = with_icon.into_entry(0).expect("the entry is still valid");
-        assert_eq!(notes, vec![ImportNote::IconDropped]);
+        with_icon.icon = Some(icon.clone());
+        let (entry, notes) = with_icon.into_entry(0).expect("the entry is still valid");
+        assert_eq!(entry.icon, Some(icon));
+        assert!(
+            notes.is_empty(),
+            "keeping the icon is not something to report"
+        );
     }
 
     #[test]

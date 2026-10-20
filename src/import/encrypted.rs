@@ -338,62 +338,11 @@ fn decode_utf8_json(plaintext: &[u8]) -> Result<JsonValue> {
 
 /// Decodes standard base64, which is what the format writes for the database.
 ///
-/// The alphabet is the standard one (`+` and `/`), padding is present, and no whitespace is
-/// written; anything outside that is refused rather than skipped, since a decoder that tolerates
-/// extra characters turns a modified file into a shorter one.
+/// The decoder itself is shared with the icon reader (see [`crate::import::decode_base64`]); this
+/// wrapper only turns "not base64" into this module's error.
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
-    let bytes = text.as_bytes();
-    let chunks = bytes.len() / 4;
-    if !bytes.len().is_multiple_of(4) {
-        return Err(malformed("the encrypted database is not valid base64"));
-    }
-    let mut out = Vec::with_capacity(chunks * 3);
-
-    for (index_of_chunk, chunk) in bytes.chunks(4).enumerate() {
-        let mut values = [0_u8; 4];
-        let mut padding = 0_usize;
-        for (index, byte) in chunk.iter().enumerate() {
-            if *byte == b'=' {
-                padding += 1;
-                continue;
-            }
-            if padding > 0 {
-                // A character after padding means the padding is not at the end of its chunk.
-                return Err(malformed("the encrypted database is not valid base64"));
-            }
-            values[index] = base64_value(*byte)
-                .ok_or(malformed("the encrypted database is not valid base64"))?;
-        }
-        // Padding can only end the **last** chunk, and at most two characters of it can be
-        // padding: anything else decodes to a string that was never encoded this way.
-        if padding > 2 || (padding > 0 && index_of_chunk + 1 != chunks) {
-            return Err(malformed("the encrypted database is not valid base64"));
-        }
-
-        let bits = (u32::from(values[0]) << 18)
-            | (u32::from(values[1]) << 12)
-            | (u32::from(values[2]) << 6)
-            | u32::from(values[3]);
-        out.push((bits >> 16) as u8);
-        if padding < 2 {
-            out.push((bits >> 8) as u8);
-        }
-        if padding == 0 {
-            out.push(bits as u8);
-        }
-    }
-    Ok(out)
-}
-/// The value of one base64 character.
-const fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
+    crate::import::decode_base64(text)
+        .ok_or_else(|| malformed("the encrypted database is not valid base64"))
 }
 
 /// Decodes hexadecimal text, upper or lower case.

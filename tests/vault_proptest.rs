@@ -454,12 +454,12 @@ fn clone_entry(entry: &Entry) -> Entry {
 fn file_format_constants_are_stable() {
     assert_eq!(MAGIC, b"Q2FAVLT\0", "the magic is an external contract");
     assert_eq!(
-        FORMAT_VERSION, 3,
+        FORMAT_VERSION, 4,
         "the version takes part in the AAD, so changing it makes every old file unopenable"
     );
     assert_eq!(
         READABLE_VERSIONS,
-        &[1, 2, 3],
+        &[1, 2, 3, 4],
         "readable versions only grow: removing one would suddenly make users' old files unopenable"
     );
     assert_eq!(vault::MASTER_KEY_LEN, 32, "master key length");

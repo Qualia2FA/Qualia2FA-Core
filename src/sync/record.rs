@@ -57,8 +57,13 @@ use crate::vault::crypto;
 use crate::vault::{Entry as VaultEntry, EntryId, Group, GroupId, Tombstone};
 use crate::{Error, Result};
 
-/// Length of the entry plaintext header: magic 4 + id 16 + length 2.
-const ENTRY_HEADER_LEN: usize = 4 + EntryId::LEN + 2;
+/// Length of the entry plaintext header: magic 4 + id 16 + length 4.
+///
+/// The length is a **u32**, not the u16 of payload versions 1 to 3: an entry may carry an icon of
+/// up to 64 KiB, and a u16 would make an icon-bearing entry "storable in the vault but not
+/// syncable", failing with a malformed-record error that says nothing about icons. The group
+/// header uses the same width for the same reason: its child list can approach 64 KiB.
+const ENTRY_HEADER_LEN: usize = 4 + EntryId::LEN + 4;
 
 /// Magic number of the entry plaintext header.
 ///
@@ -146,17 +151,17 @@ impl OpenedRecord {
 ///
 /// # Errors
 ///
-/// - [`Error::SyncMalformed`]: the entry encoding exceeds 65535 bytes. Real entries are far smaller
-///   (the longest field is capped at 64 KiB), so this only happens when the encoding logic is
-///   wrong.
+/// - [`Error::SyncMalformed`]: the entry encoding exceeds [`u32::MAX`] bytes. Real entries are far
+///   smaller (the longest field is capped at 64 KiB), so this only happens when the encoding logic
+///   is wrong.
 /// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
 pub fn seal_entry(key: &[u8; 32], id: &EntryId, entry: &VaultEntry) -> Result<Record> {
     let body = crate::vault::encode_entry(entry)?;
     let mut plaintext = Vec::with_capacity(ENTRY_HEADER_LEN + body.len());
     plaintext.extend_from_slice(ENTRY_MAGIC);
     plaintext.extend_from_slice(id.as_bytes());
-    let len = u16::try_from(body.len()).map_err(|_| Error::SyncMalformed {
-        reason: "a single entry encodes to more than 65535 bytes",
+    let len = u32::try_from(body.len()).map_err(|_| Error::SyncMalformed {
+        reason: "a single entry encodes to more than 4294967295 bytes",
     })?;
     plaintext.extend_from_slice(&len.to_be_bytes());
     plaintext.extend_from_slice(&body);
@@ -186,15 +191,15 @@ pub fn seal_tombstone(key: &[u8; 32], tombstone: &Tombstone) -> Result<Record> {
 ///
 /// # Errors
 ///
-/// - [`Error::SyncMalformed`]: the group encoding exceeds 65535 bytes.
+/// - [`Error::SyncMalformed`]: the group encoding exceeds [`u32::MAX`] bytes.
 /// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
 pub fn seal_group(key: &[u8; 32], id: &GroupId, group: &Group) -> Result<Record> {
     let body = crate::vault::encode_group(group)?;
     let mut plaintext = Vec::with_capacity(ENTRY_HEADER_LEN + body.len());
     plaintext.extend_from_slice(GROUP_MAGIC);
     plaintext.extend_from_slice(id.as_bytes());
-    let len = u16::try_from(body.len()).map_err(|_| Error::SyncMalformed {
-        reason: "a single group encodes to more than 65535 bytes",
+    let len = u32::try_from(body.len()).map_err(|_| Error::SyncMalformed {
+        reason: "a single group encodes to more than 4294967295 bytes",
     })?;
     plaintext.extend_from_slice(&len.to_be_bytes());
     plaintext.extend_from_slice(&body);
@@ -315,10 +320,11 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
             reason: "the identifier in the entry plaintext differs from the record identifier",
         });
     }
-    let len_bytes: [u8; 2] = plaintext[4 + EntryId::LEN..ENTRY_HEADER_LEN]
+    let len_bytes: [u8; 4] = plaintext[4 + EntryId::LEN..ENTRY_HEADER_LEN]
         .try_into()
         .map_err(|_| Error::SyncTruncated)?;
-    let declared = usize::from(u16::from_be_bytes(len_bytes));
+    let declared =
+        usize::try_from(u32::from_be_bytes(len_bytes)).map_err(|_| Error::SyncTruncated)?;
     let body = plaintext
         .get(ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + declared)
         .ok_or(Error::SyncTruncated)?;
@@ -364,10 +370,11 @@ fn open_group(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
             reason: "the identifier in the group plaintext differs from the record identifier",
         });
     }
-    let len_bytes: [u8; 2] = plaintext[4 + GroupId::LEN..ENTRY_HEADER_LEN]
+    let len_bytes: [u8; 4] = plaintext[4 + GroupId::LEN..ENTRY_HEADER_LEN]
         .try_into()
         .map_err(|_| Error::SyncTruncated)?;
-    let declared = usize::from(u16::from_be_bytes(len_bytes));
+    let declared =
+        usize::try_from(u32::from_be_bytes(len_bytes)).map_err(|_| Error::SyncTruncated)?;
     let body = plaintext
         .get(ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + declared)
         .ok_or(Error::SyncTruncated)?;
@@ -378,7 +385,7 @@ fn open_group(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     }
     Ok(OpenedRecord::Group {
         id: GroupId::from_bytes(embedded),
-        group: Box::new(crate::vault::decode_group(body)?),
+        group: Box::new(crate::vault::decode_group(body, FORMAT_VERSION)?),
     })
 }
 
@@ -650,7 +657,7 @@ mod tests {
             0x82,
             "the sync tombstone kind byte changed"
         );
-        assert_eq!(FORMAT_VERSION, 3, "the payload format version changed");
+        assert_eq!(FORMAT_VERSION, 4, "the payload format version changed");
     }
 
     /// **The record kind bytes of the two domains must not overlap, and each parser must refuse the

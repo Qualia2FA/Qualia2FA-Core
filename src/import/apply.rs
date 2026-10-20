@@ -550,7 +550,7 @@ mod tests {
         );
         assert_eq!(
             vault.ordering(&GroupId::TOP),
-            Some([existing].as_slice()),
+            Some(vec![existing]),
             "and the row did not move"
         );
     }

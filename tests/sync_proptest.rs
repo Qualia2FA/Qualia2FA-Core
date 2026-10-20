@@ -294,14 +294,9 @@ proptest! {
                 "a group name changed in transit"
             );
             prop_assert_eq!(
-                received.group_order,
-                group.group_order,
-                "a group position changed in transit"
-            );
-            prop_assert_eq!(
-                &received.entry_ids,
-                &group.entry_ids,
-                "an ordering changed in transit"
+                &received.children,
+                &group.children,
+                "a group arrangement changed in transit"
             );
         }
 

@@ -118,12 +118,29 @@ pub const MAGIC: &[u8; 8] = b"Q2FASYNC";
 /// Nothing else about the payload layout changed: the only difference is the number, which
 /// takes part in both the outer and the inner AAD.
 ///
+/// # Version 3 → 4: the group tree, the icon, and u32 length prefixes
+///
+/// Three shapes changed at once, and all three are why a version 3 peer must refuse the payload
+/// rather than skip what it does not know:
+///
+/// - A group plaintext now carries one ordered child list (entries and child groups mixed)
+///   instead of a flat position and an entry list. An older peer would find neither of the nodes
+///   it needs.
+/// - An entry plaintext may carry an icon node. An older peer would skip it by its length, keep
+///   the entry without its picture, and write that loss back into its own vault - a silent one,
+///   which is the worst kind.
+/// - The length prefix of both plaintext headers is now a **u32**. An icon of up to 64 KiB, or a
+///   group whose child list approaches 64 KiB, does not fit a u16: it would be refused as
+///   malformed on both sides of a payload that is otherwise fine. The prefix width is part of the
+///   version for the same reason as the rest: a version 3 record would be read with the wrong
+///   width.
+///
 /// # It also takes part in the **inner** record AAD
 ///
 /// Changing it makes the inner records of existing payloads unopenable. That is what stops
 /// cross-version transplanting: an inner record of an older version must not be moved into a
 /// newer payload.
-pub const FORMAT_VERSION: u8 = 3;
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Payload version number used only by version 1.
 ///
@@ -1115,7 +1132,7 @@ mod tests {
         assert_eq!(&HKDF_SALT_SYNC, b"Qualia2FA sync salt v1 (records)");
         assert_eq!(HKDF_SALT_SYNC.len(), 32);
         assert_eq!(MAGIC, b"Q2FASYNC");
-        assert_eq!(FORMAT_VERSION, 3);
+        assert_eq!(FORMAT_VERSION, 4);
         assert!(
             crate::vault::READABLE_VERSIONS.contains(&crate::vault::FORMAT_VERSION),
             "the version a file format declares must be in its own readable version list"
@@ -1152,6 +1169,40 @@ mod tests {
                     assert_eq!(version, LEGACY_FORMAT_VERSION_1);
                 }
                 other => panic!("version 1 was not rejected as a version, actual {other:?}"),
+            }
+        }
+    }
+
+    /// **A payload written by the previous release (version 3) is refused.**
+    ///
+    /// Version 4 changed three shapes at once - the group plaintext, the icon node inside an
+    /// entry, and the width of both plaintext length prefixes - so a version 3 peer that read
+    /// one would either fail with a misleading "malformed" diagnosis or, worse, skip the icon
+    /// and write that loss back into its vault. The version number is what makes the refusal
+    /// clean, and it is checked before anything is decrypted.
+    #[test]
+    fn a_version_3_payload_is_rejected() {
+        let previous_release = 3_u8;
+        let master = a_master_key();
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("randomness available");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
+
+        let mut previous = sealed.clone();
+        previous[MAGIC.len()] = previous_release;
+
+        for result in [
+            Payload::peek(&previous).map(|_| ()),
+            Payload::open(&master, &previous).map(|_| ()),
+        ] {
+            match result {
+                Err(Error::SyncUnsupportedVersion { version }) => {
+                    assert_eq!(version, previous_release);
+                }
+                other => {
+                    panic!("a version 3 payload was not rejected as a version, actual {other:?}")
+                }
             }
         }
     }

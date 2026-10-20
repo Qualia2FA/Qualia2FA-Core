@@ -291,11 +291,21 @@ fn entry_into(json: &mut Json, item: &Item<'_>) -> Result<()> {
     // favourite flag no interface reads would come back as an arrangement change.
     json.key("favorite");
     json.boolean(false);
-    // Icons are dropped at import and never stored, so there is nothing to write. The field is
-    // present and null rather than absent: a reader that expects it finds it, and one that does
-    // not care learns nothing false.
+    // The icon is written as the original bytes, exactly as the reference format keeps them.
+    // `icon_mime` and `icon_hash` accompany it; `icon_hash` is computed here rather than stored,
+    // so it cannot drift from the bytes. An entry with no icon writes `null`, which is what the
+    // reference implementation writes too.
     json.key("icon");
-    json.null();
+    match &entry.icon {
+        Some(icon) => json.string(&base64(&icon.bytes)),
+        None => json.null(),
+    }
+    if let Some(icon) = &entry.icon {
+        json.key("icon_mime");
+        json.string(icon.mime.media_type());
+        json.key("icon_hash");
+        json.string(&hex(&icon.hash()));
+    }
 
     json.key("info");
     json.begin_object();
@@ -859,18 +869,15 @@ mod tests {
     /// The password is required, and an empty one is not a password.
     #[test]
     fn an_encrypted_export_refuses_a_missing_or_empty_password() {
-        let (vault, _) = vault();
+        let file = crate::vault::VaultFile::create().expect("OS randomness available");
         let missing =
-            crate::export::export(&vault, crate::export::ExportFormat::EncryptedJson, None);
+            crate::export::export(&file, crate::export::ExportFormat::EncryptedJson, None);
         assert!(
             matches!(missing, Err(crate::Error::ExportPasswordRequired)),
             "actual {missing:?}"
         );
-        let empty = crate::export::export(
-            &vault,
-            crate::export::ExportFormat::EncryptedJson,
-            Some(b""),
-        );
+        let empty =
+            crate::export::export(&file, crate::export::ExportFormat::EncryptedJson, Some(b""));
         assert!(
             matches!(empty, Err(crate::Error::ExportPasswordEmpty)),
             "actual {empty:?}"
@@ -896,5 +903,53 @@ mod tests {
 
         // `GroupId::TOP` is never written, since the top group is not one a file can name.
         assert!(!text.contains(&uuid_text(GroupId::TOP.as_bytes())));
+    }
+
+    /// An icon is written as the three fields the reference format defines, and reads back.
+    #[test]
+    fn an_icon_round_trips_through_the_export() {
+        let icon =
+            crate::vault::EntryIcon::new(crate::vault::IconMime::Png, vec![0x89, b'P', b'N', b'G'])
+                .expect("small icon");
+        let mut vault = Vault::new();
+        vault
+            .insert(entry(URIS[0], 1_600_000_000).with_icon(Some(icon.clone())))
+            .expect("the vault is empty");
+
+        let text = write(&vault).expect("the export is written");
+        assert!(
+            text.contains("\"icon_mime\":\"image/png\""),
+            "the media type is written: {text}"
+        );
+        assert!(
+            text.contains(&format!("\"icon_hash\":\"{}\"", hex(&icon.hash()))),
+            "the hash is computed from what is stored: {text}"
+        );
+        assert!(
+            text.contains("\"icon\":\"iVBORw==\""),
+            "the bytes are the original file, base64: {text}"
+        );
+
+        let report = read_back(&text, None);
+        assert_eq!(
+            report.entries[0].entry.icon,
+            Some(icon),
+            "the picture survives the round trip"
+        );
+        assert_eq!(report.dropped.icons, 0);
+    }
+
+    /// An entry without an icon writes `icon: null` and no media type, which is the shape the
+    /// reference implementation writes.
+    #[test]
+    fn an_entry_without_an_icon_writes_null_and_nothing_else() {
+        let mut vault = Vault::new();
+        vault
+            .insert(entry(URIS[0], 1_600_000_000))
+            .expect("the vault is empty");
+        let text = write(&vault).expect("the export is written");
+        assert!(text.contains("\"icon\":null"), "actual {text}");
+        assert!(!text.contains("icon_mime"), "actual {text}");
+        assert!(!text.contains("icon_hash"), "actual {text}");
     }
 }

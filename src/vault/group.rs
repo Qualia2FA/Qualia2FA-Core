@@ -13,37 +13,40 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! Groups and the ordering of entries.
+//! Groups: the tree that arranges entries, and the ordered lists it is built from.
 //!
-//! A group is an account-level fact: a named collection of entries that the user can reorder.
-//! This module holds the two types that carry it, [`GroupId`] and [`Group`]; the vault stores
-//! them and the file format writes them.
+//! A group is an account-level fact: a named collection of entries and of **child groups**. This
+//! module holds the two types that carry it, [`GroupId`] and [`Group`], plus [`GroupChild`]; the
+//! vault stores them and the file format writes them.
 //!
-//! # The order is the list, not a number on each entry
+//! # The tree is the lists, not a parent field
 //!
-//! Every group holds `entry_ids` in order, and **the sequence number of an entry is its index
-//! in that list**. There is deliberately no "position" field on an entry:
+//! A group record is **its ordered list of child references**. Which group is the parent of a
+//! reference is decided by "whose list it appears in", never by a field on the child. There is no
+//! second copy of that fact to disagree with the first:
 //!
-//! - reordering rewrites one group record and touches no entry at all;
-//! - adjudicating a conflict is "pick one of two whole lists", which is the granularity the
-//!   synchronisation rules ask for;
+//! - moving one child rewrites two lists, and each list is written whole;
 //! - an entry's membership is derived from the lists, so the entry format needs neither "which
-//!   group am I in" nor "which position do I hold" - two fields, and two chances for the two
-//!   sides to disagree, are gone.
+//!   group am I in" nor "which position do I hold";
+//! - the file format, the sync payload and the in-memory model all hold exactly one shape.
 //!
-//! The cost is that a list is a **sequence, not a set**: two devices that hold the same entries
+//! The cost is that a list is a **sequence, not a set**: two devices that hold the same children
 //! in different orders hold different lists, and that difference is a conflict to show the user
 //! rather than something to merge automatically.
 //!
 //! # The top group
 //!
-//! Entries that belong to no named group still form one sortable whole, and it is a group like
-//! any other with the reserved identifier [`GroupId::TOP`]. The user interface pins it at the
-//! top and offers no way to delete it, so [`Vault::remove_group`](crate::vault::Vault::remove_group)
-//! refuses it.
+//! Entries that belong to no named group still form one sortable whole, and it is a group like any
+//! other with the reserved identifier [`GroupId::TOP`]. The user interface pins it at the top and
+//! offers no way to delete it, so [`Vault::remove_group`](crate::vault::Vault::remove_group) refuses
+//! it. It is the root of the tree: named groups that have no parent live in its child list.
 //!
-//! The top group's `group_order` is stored as 0 and is **not meaningful**: its position is
-//! fixed by definition, not by the number. Named groups order themselves among themselves.
+//! # Depth
+//!
+//! The top group is depth zero. Named groups may be nested up to
+//! [`Vault::MAX_GROUP_DEPTH`](crate::vault::Vault::MAX_GROUP_DEPTH); entries may sit at any
+//! depth. The vault enforces both when a list is written, and the parser repairs a file that
+//! violates them.
 
 use crate::{Error, Result};
 
@@ -60,7 +63,7 @@ impl GroupId {
     /// Byte length of an identifier.
     pub const LEN: usize = 16;
 
-    /// The reserved identifier of the **top group**: the entries that belong to no named group.
+    /// The reserved identifier of the **top group**: the root of the tree.
     ///
     /// All zeroes, which no generated identifier can be in practice: [`GroupId::generate`]
     /// draws 128 random bits, so the chance of a collision is the chance of drawing exactly
@@ -123,43 +126,63 @@ impl core::fmt::Debug for GroupId {
     }
 }
 
-/// A named group, with the ordering of the entries it holds.
+/// One child of a group: either an entry or another group.
 ///
-/// The list **is** the order: the entry at index `i` comes after the entry at index `i - 1` and
-/// before the one at index `i + 1`. See the module documentation for why the sequence number is
-/// not stored on the entry.
+/// The two live in one list because the list **is** the display order: an entry and a child group
+/// have to be comparable to say "this entry comes before that group". The variant is the child's
+/// kind, so the file format needs one node and the merge one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupChild {
+    /// An entry that belongs to no other group.
+    Entry(crate::vault::EntryId),
+    /// A named group whose children hang here.
+    Group(GroupId),
+}
+
+impl GroupChild {
+    /// The 16-byte identifier of the child, whichever kind it is.
+    #[must_use]
+    pub const fn id_bytes(&self) -> &[u8; GroupId::LEN] {
+        match self {
+            Self::Entry(id) => id.as_bytes(),
+            Self::Group(id) => id.as_bytes(),
+        }
+    }
+}
+
+/// A named group: a name and the ordered list of its children.
+///
+/// The list **is** the order: the child at index `i` comes after the child at index `i - 1` and
+/// before the one at index `i + 1`.
 ///
 /// # Why this one does implement `Clone`
 ///
-/// A group holds a name, a position and identifiers - **no secret material**, and no key
-/// material of any kind. Copying it is free in the sense that matters here, and both a conflict
-/// (which must show the two orderings side by side) and the merge that reports it need copies.
-/// Compare [`crate::vault::Entry`], which deliberately has no `Clone`: copying an entry means
-/// copying a seed, so that path goes through an explicit [`crate::vault::Entry::duplicate`].
+/// A group holds a name and identifiers - **no secret material**, and no key material of any
+/// kind. Copying it is free in the sense that matters here, and both a conflict (which must show
+/// the two arrangements side by side) and the merge that reports it need copies. Compare
+/// [`crate::vault::Entry`], which deliberately has no `Clone`: copying an entry means copying a
+/// seed, so that path goes through an explicit [`crate::vault::Entry::duplicate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     /// User-visible name. Empty for the top group, which is not nameable.
     pub name: String,
-    /// Position among the **named** groups; a smaller number comes first.
+    /// The entries and child groups of this group, in display order.
     ///
-    /// Ignored for the top group, whose position is fixed (see the module documentation).
-    pub group_order: u32,
-    /// The entries of this group, in display order.
-    ///
-    /// Every identifier may appear in **at most one** list of one group; the vault keeps that
-    /// true (see [`Vault::set_ordering`](crate::vault::Vault::set_ordering)), and the parser
+    /// Every reference may appear in **at most one** list of one group; the vault keeps that
+    /// true (see [`Vault::set_children`](crate::vault::Vault::set_children)), and the parser
     /// repairs a file that violates it.
-    pub entry_ids: Vec<crate::vault::EntryId>,
+    pub children: Vec<GroupChild>,
 }
 
 impl Group {
-    /// Maximum number of entries one group can hold.
+    /// Maximum number of children one group can hold.
     ///
-    /// The identifier list travels in a single length-prefixed node, so it is bounded by
-    /// [`crate::vault::Entry::MAX_FIELD_LEN`]: `65_536 / 16` (the length of one identifier).
-    /// The limit is far above any real group - a thousand entries already fills a screen many
-    /// times over.
-    pub const MAX_ENTRIES: usize = crate::vault::Entry::MAX_FIELD_LEN / GroupId::LEN;
+    /// The list travels in a single length-prefixed node, so it is bounded by
+    /// [`crate::vault::Entry::MAX_FIELD_LEN`]: `(65_536 - 5) / (1 + 16)`, the five bytes being
+    /// the node tag and its u32 length and the seventeen the size of one child reference. The
+    /// limit is far above any real group - a thousand entries already fills a screen many times
+    /// over.
+    pub const MAX_CHILDREN: usize = (crate::vault::Entry::MAX_FIELD_LEN - 5) / (1 + GroupId::LEN);
 
     /// Builds a group from its parts.
     ///
@@ -167,18 +190,14 @@ impl Group {
     ///
     /// Returns [`Error::FieldTooLong`] when the name exceeds
     /// [`Entry::MAX_FIELD_LEN`](crate::vault::Entry::MAX_FIELD_LEN), and
-    /// [`Error::VaultGroupTooManyEntries`] when the list holds more than [`Group::MAX_ENTRIES`]
-    /// identifiers.
+    /// [`Error::VaultGroupTooManyChildren`] when the list holds more than [`Group::MAX_CHILDREN`]
+    /// references.
     ///
-    /// A duplicate identifier **within** the list is rejected as
-    /// [`Error::VaultGroupDuplicateEntry`]: the list is an ordering, and one entry cannot occupy two
-    /// positions in the same ordering. Whether an entry may appear in two *different* groups is
-    /// a question for the vault, not for one group.
-    pub fn new(
-        name: String,
-        group_order: u32,
-        entry_ids: Vec<crate::vault::EntryId>,
-    ) -> Result<Self> {
+    /// A reference that appears twice **within** the list is rejected as
+    /// [`Error::VaultGroupDuplicateChild`]: the list is an ordering, and one child cannot occupy
+    /// two positions in the same ordering. Whether a child may appear in two *different* groups
+    /// is a question for the vault, not for one group.
+    pub fn new(name: String, children: Vec<GroupChild>) -> Result<Self> {
         if name.len() > crate::vault::Entry::MAX_FIELD_LEN {
             return Err(Error::FieldTooLong {
                 field: "group name",
@@ -186,60 +205,73 @@ impl Group {
                 actual: name.len(),
             });
         }
-        if entry_ids.len() > Self::MAX_ENTRIES {
-            return Err(Error::VaultGroupTooManyEntries {
-                limit: Self::MAX_ENTRIES,
-                actual: entry_ids.len(),
+        if children.len() > Self::MAX_CHILDREN {
+            return Err(Error::VaultGroupTooManyChildren {
+                limit: Self::MAX_CHILDREN,
+                actual: children.len(),
             });
         }
-        if first_duplicate(&entry_ids).is_some() {
-            return Err(Error::VaultGroupDuplicateEntry);
+        if first_duplicate(&children).is_some() {
+            return Err(Error::VaultGroupDuplicateChild);
         }
-        Ok(Self {
-            name,
-            group_order,
-            entry_ids,
-        })
+        Ok(Self { name, children })
     }
 
-    /// The top group, holding the given entries in the given order.
+    /// The top group, holding the given children in the given order.
     ///
     /// # Errors
     ///
-    /// As [`Group::new`]; the name is empty by definition and the order is not meaningful.
-    pub fn top(entry_ids: Vec<crate::vault::EntryId>) -> Result<Self> {
-        Self::new(String::new(), 0, entry_ids)
+    /// As [`Group::new`]; the name is empty by definition.
+    pub fn top(children: Vec<GroupChild>) -> Result<Self> {
+        Self::new(String::new(), children)
     }
 
     /// An empty top group.
     ///
-    /// Used when a vault gains its first entry, or when a file that has entries but no group
-    /// records is read: the top group then holds every entry, in file order.
+    /// Used when a vault gains its first entry or group, or when a file that has entries but no
+    /// group records is read: the top group then holds every entry, in file order.
     pub(crate) fn top_empty() -> Self {
         Self {
             name: String::new(),
-            group_order: 0,
-            entry_ids: Vec::new(),
+            children: Vec::new(),
         }
     }
 
-    /// Whether this is the top group.
+    /// Whether this group is the reserved top group, by name.
+    ///
+    /// Only the root has no name; a named group may be given an empty one by a file written by
+    /// another implementation, and that is still a named group. Prefer
+    /// [`GroupId::is_top`] where the identifier is at hand.
     #[must_use]
-    pub const fn is_top_name(&self) -> bool {
+    pub fn has_no_name(&self) -> bool {
         self.name.is_empty()
+    }
+
+    /// The entry identifiers in this group, in display order.
+    ///
+    /// A **view**: the child list is the truth, and this is the subset that names entries. A
+    /// caller that needs the whole arrangement reads [`Group::children`].
+    #[must_use]
+    pub fn entry_ids(&self) -> Vec<crate::vault::EntryId> {
+        self.children
+            .iter()
+            .filter_map(|child| match child {
+                GroupChild::Entry(id) => Some(*id),
+                GroupChild::Group(_) => None,
+            })
+            .collect()
     }
 }
 
-/// Returns the first identifier that appears more than once, if any.
+/// Returns the first reference that appears more than once, if any.
 ///
 /// Quadratic in the list length and deliberately so: the lists are small (a screenful or two),
 /// the check runs once per construction rather than per comparison, and the alternative - a
-/// sorted copy - would mean copying the list of identifiers on a path that runs for every
-/// group of every parse.
-fn first_duplicate(ids: &[crate::vault::EntryId]) -> Option<crate::vault::EntryId> {
-    for (index, id) in ids.iter().enumerate() {
-        if ids[index + 1..].contains(id) {
-            return Some(*id);
+/// sorted copy - would mean copying the list on a path that runs for every group of every parse.
+fn first_duplicate(children: &[GroupChild]) -> Option<GroupChild> {
+    for (index, child) in children.iter().enumerate() {
+        if children[index + 1..].contains(child) {
+            return Some(*child);
         }
     }
     None
@@ -252,6 +284,14 @@ mod tests {
 
     fn id(seed: u8) -> EntryId {
         EntryId::from_bytes([seed; EntryId::LEN])
+    }
+
+    fn gid(seed: u8) -> GroupId {
+        GroupId::from_bytes([seed; GroupId::LEN])
+    }
+
+    fn child(seed: u8) -> GroupChild {
+        GroupChild::Entry(id(seed))
     }
 
     #[test]
@@ -277,26 +317,27 @@ mod tests {
     }
 
     #[test]
-    fn a_group_keeps_its_name_order_and_list() {
-        let group = Group::new("Work".to_owned(), 3, vec![id(1), id(2)]).expect("valid group");
+    fn a_group_keeps_its_name_and_children() {
+        let group = Group::new("Work".to_owned(), vec![child(1), GroupChild::Group(gid(2))])
+            .expect("valid group");
         assert_eq!(group.name, "Work");
-        assert_eq!(group.group_order, 3);
-        assert_eq!(group.entry_ids, vec![id(1), id(2)]);
-        assert!(!group.is_top_name());
-        assert!(Group::top(vec![]).expect("valid group").is_top_name());
+        assert_eq!(group.children, vec![child(1), GroupChild::Group(gid(2))]);
+        assert_eq!(group.entry_ids(), vec![id(1)]);
+        assert!(!group.has_no_name());
+        assert!(Group::top(vec![]).expect("valid group").has_no_name());
     }
 
     #[test]
-    fn a_duplicate_identifier_in_one_list_is_rejected() {
-        let err = Group::new("Work".to_owned(), 0, vec![id(1), id(2), id(1)]);
+    fn a_duplicate_child_in_one_list_is_rejected() {
+        let err = Group::new("Work".to_owned(), vec![child(1), child(2), child(1)]);
         assert!(
-            matches!(err, Err(Error::VaultGroupDuplicateEntry)),
-            "one entry cannot hold two positions in the same ordering"
+            matches!(err, Err(Error::VaultGroupDuplicateChild)),
+            "one child cannot hold two positions in the same ordering"
         );
 
         assert!(
-            Group::new("Work".to_owned(), 0, vec![id(1), id(2), id(3)]).is_ok(),
-            "distinct identifiers are fine"
+            Group::new("Work".to_owned(), vec![child(1), child(2), child(3)]).is_ok(),
+            "distinct references are fine"
         );
     }
 
@@ -304,11 +345,11 @@ mod tests {
     fn an_over_long_name_or_list_is_rejected() {
         let long = "n".repeat(crate::vault::Entry::MAX_FIELD_LEN + 1);
         assert!(matches!(
-            Group::new(long, 0, vec![]),
+            Group::new(long, vec![]),
             Err(Error::FieldTooLong { .. })
         ));
 
-        let too_many: Vec<EntryId> = (0..=Group::MAX_ENTRIES)
+        let too_many: Vec<GroupChild> = (0..=Group::MAX_CHILDREN)
             .map(|index| {
                 let mut bytes = [0_u8; EntryId::LEN];
                 bytes[..8].copy_from_slice(
@@ -316,15 +357,24 @@ mod tests {
                         .expect("the test range fits in u64")
                         .to_be_bytes(),
                 );
-                EntryId::from_bytes(bytes)
+                GroupChild::Entry(EntryId::from_bytes(bytes))
             })
             .collect();
         assert!(
             matches!(
-                Group::new(String::new(), 0, too_many),
-                Err(Error::VaultGroupTooManyEntries { .. })
+                Group::new(String::new(), too_many),
+                Err(Error::VaultGroupTooManyChildren { .. })
             ),
             "the list travels in one node, so it is bounded by MAX_FIELD_LEN"
         );
+    }
+
+    /// The bound is the one the node can hold: 17 bytes per reference plus the node header.
+    #[test]
+    fn the_child_limit_matches_the_node_it_travels_in() {
+        assert_eq!(Group::MAX_CHILDREN, 3854);
+        let per_child = 1 + GroupId::LEN;
+        assert!(5 + Group::MAX_CHILDREN * per_child <= crate::vault::Entry::MAX_FIELD_LEN);
+        assert!(5 + (Group::MAX_CHILDREN + 1) * per_child > crate::vault::Entry::MAX_FIELD_LEN);
     }
 }

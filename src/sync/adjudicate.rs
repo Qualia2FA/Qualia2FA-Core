@@ -128,6 +128,10 @@ pub fn adjudicate(
                     .group_mut(&group_id)
                     .ok_or(crate::Error::VaultGroupNotFound)?;
                 *group = incoming.as_ref().clone();
+                // The peer's list may name a child that this device lists elsewhere, or a group
+                // that would close a cycle. Repairing the tree here keeps the invariant every
+                // other operation relies on: one parent per child, no cycles, depth in range.
+                vault.rebuild_tree(&[], &[]);
                 Ok(Adjudicated::TookIncomingOrdering)
             }
         },
@@ -154,7 +158,9 @@ mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::sync::{MergedRecord, RecordSet, merge_into};
-    use crate::vault::{Entry, EntryId, EntryKind, Group, GroupId, Timestamp, Tombstone};
+    use crate::vault::{
+        Entry, EntryId, EntryKind, Group, GroupChild, GroupId, Timestamp, Tombstone,
+    };
 
     /// A sample entry whose content is recognisable in an assertion.
     fn sample_entry(name: &str, updated_at: u64) -> Entry {
@@ -451,7 +457,10 @@ mod tests {
     fn incoming_top_group(entry_ids: Vec<EntryId>) -> MergedRecord {
         MergedRecord::Group {
             id: GroupId::TOP,
-            group: Box::new(Group::top(entry_ids).expect("the list is valid")),
+            group: Box::new(
+                Group::top(entry_ids.into_iter().map(GroupChild::Entry).collect())
+                    .expect("the list is valid"),
+            ),
         }
     }
 
@@ -466,7 +475,7 @@ mod tests {
             &[MergedRecord::Group {
                 id: work,
                 group: Box::new(
-                    Group::new("Work".to_owned(), 0, Vec::new()).expect("the group is valid"),
+                    Group::new("Work".to_owned(), Vec::new()).expect("the group is valid"),
                 ),
             }],
         )
@@ -532,7 +541,7 @@ mod tests {
         assert!(outcome.conflicts.is_empty(), "actual {outcome:?}");
         assert_eq!(
             vault.ordering(&GroupId::TOP),
-            Some([second, first].as_slice()),
+            Some(vec![second, first]),
             "the arrangement is the peer's"
         );
     }
@@ -560,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             vault.ordering(&GroupId::TOP),
-            Some([first, second].as_slice()),
+            Some(vec![first, second]),
             "a conflict writes nothing until it is adjudicated"
         );
 
@@ -568,10 +577,7 @@ mod tests {
             adjudicate(&mut vault, conflict, Decision::KeepLocal).expect("keeping cannot fail"),
             Adjudicated::KeptLocal
         );
-        assert_eq!(
-            vault.ordering(&GroupId::TOP),
-            Some([first, second].as_slice())
-        );
+        assert_eq!(vault.ordering(&GroupId::TOP), Some(vec![first, second]));
 
         assert_eq!(
             adjudicate(&mut vault, conflict, Decision::TakeIncoming)
@@ -580,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             vault.ordering(&GroupId::TOP),
-            Some([second, first].as_slice()),
+            Some(vec![second, first]),
             "the whole arrangement was replaced"
         );
     }
