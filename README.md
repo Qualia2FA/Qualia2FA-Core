@@ -30,7 +30,7 @@ Qualia2FA 的核心库。
 | 项         | 值                                        |
 |------------|-------------------------------------------|
 | Crate 名   | `qualia2fa-core`                          |
-| 版本       | `0.3.2`                                   |
+| 版本       | `0.4.0`                                   |
 | 类型       | 纯 library crate                          |
 | Edition    | 2024                                      |
 | MSRV       | **1.89**                                  |
@@ -142,6 +142,35 @@ for (id, entry) in file.vault().iter() {
   才可裁决。墓碑不设过期，每条 45 字节。
 - 密文长度会泄露备注、账号名的**长短**。这是已知的、有意的取舍：掩盖它需要填充
   到定长块，代价是文件变大数倍。
+
+### 解锁密码
+
+主密钥通常放在平台密钥库里，读出它不需要用户做任何事。要在打开保险库之前先要求
+一次认证，就把主密钥另存一份**只有口令能打开**的包裹，放在保险库旁边：
+
+```rust
+use qualia2fa_core::{KdfParams, SecretString, lock};
+
+let password = SecretString::from("the unlock password".to_owned());
+
+// 写入：Argon2id 派生 + XChaCha20-Poly1305，结果写进 master.key.pw。
+let wrap = lock::wrap(&master_key, &password, &KdfParams::recommended())?;
+std::fs::write("master.key.pw", &wrap)?;
+
+// 读取：口令错就是口令错，不会解出一把「另一把密钥」。
+let recovered = lock::unwrap(&wrap, &password)?;
+```
+
+包裹文件是定长 110 字节，自带 KDF 参数与随机盐，因此旧文件永远读得回来；参数来自
+文件，属于不可信输入，**边界检查在 Argon2id 运行之前**完成。口令错、参数越界、版本
+不认识是三种不同的错误，调用方据此区分「密码不对」和「文件坏了」。
+
+与之配套的还有两个**不含任何秘密**的状态文件：`lock.marker`（锁已启用，以及两条
+解锁路径是否可用）与 `lock.pending`（一次加锁操作写到一半）。它们的取值只用来决定
+「该显示哪个界面」，真正的判据永远是包裹文件本身能不能打开——标记文件可以被随意
+改写，而一个写着「已上锁」却没有包裹的设备，必须按打不开处理，而不是按没上锁处理。
+
+平台认证那一条路径（`master.key.bio`）不在本库：它需要平台 API，而本库不碰平台。
 
 ## 兼容性
 

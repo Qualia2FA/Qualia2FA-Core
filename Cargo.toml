@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-core"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 # MSRV policy: 1.89 is the minimum supported version, not the development toolchain.
 # The development toolchain is pinned to stable (currently 1.99) by rust-toolchain.toml.

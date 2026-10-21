@@ -32,7 +32,7 @@ as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.3.2` |
+| Version | `0.4.0` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -153,6 +153,40 @@ A few things worth knowing:
 - The ciphertext length leaks the **length** of a note or an account name. This is a known,
   deliberate trade-off: hiding it would take padding to fixed-size blocks at several times
   the file size.
+
+### The unlock password
+
+The master key usually lives in the platform key store, and reading it asks the user for
+nothing. To require one authentication before the vault opens, keep a second copy of the
+master key — one that **only the password opens** — beside the vault:
+
+```rust
+use qualia2fa_core::{KdfParams, SecretString, lock};
+
+let password = SecretString::from("the unlock password".to_owned());
+
+// Writing: Argon2id derivation plus XChaCha20-Poly1305, written to master.key.pw.
+let wrap = lock::wrap(&master_key, &password, &KdfParams::recommended())?;
+std::fs::write("master.key.pw", &wrap)?;
+
+// Reading: a wrong password is a wrong password, never "a different key".
+let recovered = lock::unwrap(&wrap, &password)?;
+```
+
+The wrap file is a fixed 110 bytes and carries its own KDF parameters and random salt, so
+old files stay readable forever. Those parameters come from the file and are therefore
+untrusted: the bounds are checked **before** Argon2id runs. A wrong password, out-of-range
+parameters and an unknown version are three different errors, which is how a caller tells
+"the password is wrong" from "the file is broken".
+
+Two companion files hold **no secret at all**: `lock.marker` (the lock is on, and which of
+the two unlock paths are available) and `lock.pending` (a lock operation stopped halfway).
+Their values only decide which screen to show; the real criterion is always whether the wrap
+itself opens. A marker can be rewritten by anyone, and a device that claims to be locked
+without a wrap must be treated as unopenable rather than unlocked.
+
+The platform-authenticated path (`master.key.bio`) is not in this library: it needs platform
+APIs, and this library touches none.
 
 ## Compatibility
 
