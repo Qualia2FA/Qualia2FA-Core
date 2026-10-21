@@ -116,6 +116,25 @@ impl MasterKey {
     pub fn expose(&self) -> &[u8] {
         self.0.expose_secret()
     }
+
+    /// Constant-time equality.
+    ///
+    /// Used where two independently recovered keys are compared — for example "the password
+    /// wrap and the platform wrap must yield the same master key". A short-circuiting `==`
+    /// would leak how many leading bytes matched.
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        let left = self.expose();
+        let right = other.expose();
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut difference = 0_u8;
+        for (a, b) in left.iter().zip(right.iter()) {
+            difference |= a ^ b;
+        }
+        difference == 0
+    }
 }
 
 impl core::fmt::Debug for MasterKey {
@@ -634,6 +653,30 @@ mod tests {
         let bytes: SecretBytes = vec![7_u8; MASTER_KEY_LEN].into();
         let k = MasterKey::from_bytes(bytes).expect("correct length");
         assert_eq!(k.expose(), &[7_u8; MASTER_KEY_LEN]);
+    }
+
+    /// `matches` compares the whole key, and a difference in the last byte is enough.
+    #[test]
+    fn master_key_matches_compares_all_bytes() {
+        let a = MasterKey::from_bytes(vec![5_u8; MASTER_KEY_LEN].into()).expect("correct length");
+        let b = MasterKey::from_bytes(vec![5_u8; MASTER_KEY_LEN].into()).expect("correct length");
+        assert!(a.matches(&b), "equal keys must match");
+
+        let mut last = [5_u8; MASTER_KEY_LEN];
+        last[MASTER_KEY_LEN - 1] = 6;
+        let c = MasterKey::from_bytes(Vec::from(last).into()).expect("correct length");
+        assert!(
+            !a.matches(&c),
+            "a difference in the last byte must be detected"
+        );
+
+        let mut first = [5_u8; MASTER_KEY_LEN];
+        first[0] = 4;
+        let d = MasterKey::from_bytes(Vec::from(first).into()).expect("correct length");
+        assert!(
+            !a.matches(&d),
+            "a difference in the first byte must be detected"
+        );
     }
 
     /// The same master key must derive the same subkey, otherwise synced entries cannot
