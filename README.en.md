@@ -2,7 +2,7 @@
 
 # Qualia2FA-Core
 
-[简体中文](README.md) | English
+[简体中文](https://github.com/Qualia2FA/Qualia2FA-Core/blob/master/README.md) | English
 
 The core library of Qualia2FA.
 
@@ -13,7 +13,7 @@ and device pairing and sync merging.
 [![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-Core/total?logo=github&label=Downloads)][Releases]
 [![crates.io](https://img.shields.io/crates/d/qualia2fa-core?logo=crates.io&label=crates.io+Downloads)][crates.io]
 
-[License]: LICENSE
+[License]: https://github.com/Qualia2FA/Qualia2FA-Core/blob/master/LICENSE
 
 [Releases]: https://github.com/Qualia2FA/Qualia2FA-Core/releases
 
@@ -312,7 +312,7 @@ cargo +nightly fuzz run vault_parse -- -max_total_time=300
 The `otpauth://` parser, Base32 decoding and vault file parsing are all
 **attacker-controlled** input surfaces, so fuzz them whenever you change them. Historical
 crash samples are frozen in `fuzz/regressions/` and CI runs them every round. See
-[`fuzz/README.md`](fuzz/README.md) for details.
+[`fuzz/README.md`](https://github.com/Qualia2FA/Qualia2FA-Core/blob/master/fuzz/README.md) for details.
 
 ### MSRV policy
 
@@ -348,8 +348,8 @@ This project is licensed under the **GNU Lesser General Public License v3.0 or l
 GNU Lesser General Public License as published by the Free Software Foundation, either
 version 3 of the License, or (at your option) any later version.
 
-- [`COPYING.LESSER`](COPYING.LESSER): the full text of LGPL-3.0
-- [`LICENSE`](LICENSE): the full text of GPL-3.0 (LGPL-3.0 is incorporated by reference)
+- [`COPYING.LESSER`](https://github.com/Qualia2FA/Qualia2FA-Core/blob/master/COPYING.LESSER): the full text of LGPL-3.0
+- [`LICENSE`](https://github.com/Qualia2FA/Qualia2FA-Core/blob/master/LICENSE): the full text of GPL-3.0 (LGPL-3.0 is incorporated by reference)
 
 This work is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; even
 without the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
