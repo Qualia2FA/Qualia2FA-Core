@@ -84,6 +84,10 @@ use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use secrecy::zeroize::Zeroize;
 
+mod marker;
+
+pub use marker::{LockMarker, LockPending, MARKER_LEN, PENDING_LEN, STATE_FORMAT_VERSION};
+
 /// File magic.
 ///
 /// Eight bytes, no NUL terminator: unlike the recovery file, this one is never typed or

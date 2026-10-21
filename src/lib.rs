@@ -118,7 +118,7 @@ pub use recovery::{KdfParams, export as export_recovery, import as import_recove
 /// platform-authentication wrap is not here: it is a separate library, because the
 /// key never leaves the platform and this crate touches no platform API.
 pub use lock::{
-    FILE_LEN as LOCK_WRAP_LEN, WrapHeader, unwrap as unwrap_lock_password,
+    FILE_LEN as LOCK_WRAP_LEN, LockMarker, LockPending, WrapHeader, unwrap as unwrap_lock_password,
     wrap as wrap_lock_password,
 };
 

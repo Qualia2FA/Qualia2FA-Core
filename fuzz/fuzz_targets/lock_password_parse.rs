@@ -59,6 +59,9 @@ const MAX_FUZZ_ITERATIONS: u32 = 4;
 fuzz_target!(|data: &[u8]| {
     let password = SecretString::from(PASSWORD);
 
+    let _ = lock::LockMarker::parse(data);
+    let _ = lock::LockPending::parse(data);
+
     if let Ok(header) = lock::WrapHeader::parse(data) {
         let params = header.params();
         if params.memory_kib() <= MAX_FUZZ_MEMORY_KIB
