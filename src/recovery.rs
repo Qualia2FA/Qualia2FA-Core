@@ -130,7 +130,7 @@ pub const DEFAULT_ITERATIONS: u32 = 3;
 pub const PARALLELISM: u32 = 1;
 
 /// Requested output length, i.e. the length of the derived key.
-const DERIVED_KEY_LEN: usize = 32;
+pub(crate) const DERIVED_KEY_LEN: usize = 32;
 
 /// Maximum allowed memory cost: 1 GiB.
 ///
@@ -440,6 +440,24 @@ fn derive_key(
     salt: &[u8; SALT_LEN],
     params: &KdfParams,
 ) -> Result<[u8; DERIVED_KEY_LEN]> {
+    derive_key_with_context(&[], passphrase, salt, params)
+}
+
+/// Derives a key from `context` followed by the passphrase.
+///
+/// The context is a fixed, non-secret domain separator. It makes two formats that
+/// share the Argon2id construction derive **unrelated** keys from the same
+/// passphrase, so a file written for one format cannot be read by the other even
+/// after its magic bytes are rewritten. Recovery files pass an empty context; the
+/// application lock uses its own (see [`crate::lock`]).
+///
+/// The concatenation is wiped before returning. The caller wipes the key.
+pub(crate) fn derive_key_with_context(
+    context: &[u8],
+    passphrase: &SecretString,
+    salt: &[u8; SALT_LEN],
+    params: &KdfParams,
+) -> Result<[u8; DERIVED_KEY_LEN]> {
     let params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -451,10 +469,15 @@ fn derive_key(
     })?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+    let secret = passphrase.expose_secret().as_bytes();
+    let mut material = Vec::with_capacity(context.len().saturating_add(secret.len()));
+    material.extend_from_slice(context);
+    material.extend_from_slice(secret);
+
     let mut out = [0_u8; DERIVED_KEY_LEN];
-    argon2
-        .hash_password_into(passphrase.expose_secret().as_bytes(), salt, &mut out)
-        .map_err(|_| Error::RecoveryKdfFailed)?;
+    let result = argon2.hash_password_into(&material, salt, &mut out);
+    material.zeroize();
+    result.map_err(|_| Error::RecoveryKdfFailed)?;
     Ok(out)
 }
 

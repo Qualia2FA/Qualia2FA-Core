@@ -91,3 +91,13 @@ path = "fuzz_targets/sync_payload.rs"
 test = false
 doc = false
 bench = false
+
+# Attacker-controlled input surface: the application lock's password wrap. It is a file
+# beside the vault, reachable by a backup tool or an attacker with file access, and it
+# declares its own KDF cost — the bounds must be checked before Argon2id allocates.
+[[bin]]
+name = "lock_password_parse"
+path = "fuzz_targets/lock_password_parse.rs"
+test = false
+doc = false
+bench = false

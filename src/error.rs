@@ -920,6 +920,61 @@ pub enum Error {
     #[error("passphrase derivation failed (possibly out of memory)")]
     RecoveryKdfFailed,
 
+    // ── Application lock (`crate::lock`) ─────────────────────────────────────
+    /// The password-wrapped master key file is structurally invalid.
+    ///
+    /// Separate from [`Error::LockPasswordRejected`]: this variant means the bytes are not a
+    /// lock wrap at all (wrong length or magic), while that one means the file looked right but
+    /// the password did not open it. Merging them would make the user retry the password when
+    /// retrying cannot help.
+    ///
+    /// `reason` is a fixed internal description and **contains no input bytes**.
+    #[error("invalid password-wrapped master key: {reason}")]
+    LockFileMalformed {
+        /// Fixed reason description.
+        reason: &'static str,
+    },
+
+    /// The derivation parameters of a password-wrapped master key are invalid.
+    ///
+    /// These parameters come from the file and are therefore untrusted input. They are checked
+    /// **before** Argon2id runs, so a crafted file cannot make the application allocate several
+    /// terabytes or derive forever.
+    #[error("invalid lock wrap derivation parameters: {reason}")]
+    LockParametersInvalid {
+        /// Fixed reason description.
+        reason: &'static str,
+    },
+
+    /// The unlock password is empty.
+    ///
+    /// An empty password is rejected outright rather than accepted as a weak one: accepting it
+    /// would present an unlock screen that anybody can pass in a second.
+    #[error("unlock password must not be empty")]
+    LockPassphraseEmpty,
+
+    /// The password did not open the wrapped master key.
+    ///
+    /// A wrong password and a tampered file deliberately share this variant: telling them apart
+    /// would give an attacker an oracle for whether a guess was right, and the user's response
+    /// is the same in both cases.
+    #[error("the password did not open the wrapped master key")]
+    LockPasswordRejected,
+
+    /// The encryption step of the password wrap failed.
+    ///
+    /// It can only come from an AEAD implementation limit and does not happen with the lengths
+    /// in use; it is listed separately so that this case is not misreported as a wrong password.
+    #[error("lock wrap encryption failed")]
+    LockEncryptionFailed,
+
+    /// The Argon2id computation behind a password wrap failed.
+    ///
+    /// The most common real cause is **out of memory**: the default parameters allocate 64 MiB
+    /// at once.
+    #[error("lock wrap passphrase derivation failed (possibly out of memory)")]
+    LockKdfFailed,
+
     /// The version of a persisted format is not supported.
     ///
     /// Used for data that is **kept for a long time**, such as recovery files: when a file written

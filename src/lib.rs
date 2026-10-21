@@ -63,6 +63,7 @@ mod error;
 pub mod export;
 pub mod flow;
 pub mod import;
+pub mod lock;
 pub mod motp;
 pub mod otp;
 pub mod pairing;
@@ -110,6 +111,16 @@ pub use pairing::{Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
 
 /// Public types of the recovery key.
 pub use recovery::{KdfParams, export as export_recovery, import as import_recovery};
+
+/// Public types of the application lock's password wrap.
+///
+/// The wrap has its own file format and its own KDF domain; see [`lock`]. The
+/// platform-authentication wrap is not here: it is a separate library, because the
+/// key never leaves the platform and this crate touches no platform API.
+pub use lock::{
+    FILE_LEN as LOCK_WRAP_LEN, WrapHeader, unwrap as unwrap_lock_password,
+    wrap as wrap_lock_password,
+};
 
 /// Public types of the transport layer.
 ///
