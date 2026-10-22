@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-core"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # MSRV policy: 1.89 is the minimum supported version, not the development toolchain.
 # The development toolchain is pinned to stable (currently 1.99) by rust-toolchain.toml.
@@ -174,7 +174,7 @@ qualia-dik = "0.1"
 # 0.1.4 is the version that added `qr::encode_text`, which the HTML export needs: the
 # code it draws is another application's text and must not go through this project's own
 # QR envelope. 0.1.3 and earlier would not compile.
-qualia-transport = { version = "0.1.4", default-features = false, features = ["scan-image"] }
+qualia-transport = { version = "0.1.6", default-features = false, features = ["scan-image"] }
 
 # Secret-material containers (`SecretBox` / `SecretSlice` / `SecretString` /
 # `ExposeSecret`). Dependency audit, checked item by item (cargo-deny does not judge

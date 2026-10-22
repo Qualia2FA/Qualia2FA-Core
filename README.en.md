@@ -32,7 +32,7 @@ as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.4.0` |
+| Version | `0.4.1` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
